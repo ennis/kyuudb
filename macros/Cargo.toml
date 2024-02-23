@@ -1,0 +1,16 @@
+[package]
+name = "kyuudb-macros"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+quote = "1.0"
+proc-macro2 = "1.0"
+syn = { version="2.0.49", features=["derive", "full"] }
+log = "0.4.20"
+
+[dev-dependencies]
+kyuudb = { path = "../" }
