@@ -1,4 +1,3 @@
-
 /// Identifies a table in the database.
 ///
 /// Internally it's just a newtype for a u32 index.

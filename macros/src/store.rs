@@ -1,23 +1,16 @@
-use crate::store::Multiplicity::{Many, One, ZeroOrOne};
-use crate::CRATE;
-use log::error;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote, ToTokens, TokenStreamExt};
-use std::cmp;
-use std::cmp::{max, min};
-use std::collections::{HashMap, HashSet};
 use syn::{
-    braced, parenthesized,
+    parenthesized,
     parse::{Parse, ParseStream},
-    parse_macro_input, parse_quote,
     punctuated::Punctuated,
     spanned::Spanned,
-    token,
-    token::{Brace, Paren, Token},
-    AngleBracketedGenericArguments, Block, Data, Error, ExprClosure, GenericParam, Generics, Ident,
-    LitStr, ParenthesizedGenericArguments, Pat, PatIdent, PatTuple, PatWild, Path, Signature,
-    Token, Visibility,
+    token::Token,
+    Error, Ident, Token, Visibility,
 };
+
+use crate::store::Multiplicity::{Many, One, ZeroOrOne};
+use crate::CRATE;
 
 mod kw {
     syn::custom_keyword!(rel);
@@ -50,6 +43,7 @@ impl Parse for Multiplicity {
 
 /// An attribute in an entity definition (e.g. `name: String`).
 struct Attr {
+    attrs: Vec<syn::Attribute>,
     name: syn::Ident,
     ty: syn::Type,
 }
@@ -59,7 +53,11 @@ impl Parse for Attr {
         let name = input.parse()?;
         let _: Token![:] = input.parse()?;
         let ty = input.parse()?;
-        Ok(Attr { name, ty })
+        Ok(Attr {
+            attrs: vec![],
+            name,
+            ty,
+        })
     }
 }
 
@@ -71,8 +69,8 @@ enum DeleteRule {
 }
 
 /// A relationship in an entity definition (e.g. `rel album: Album?.tracks`).
-#[derive(Debug, Eq, PartialEq, Hash)]
 struct Rel {
+    attrs: Vec<syn::Attribute>,
     /// The name of the relationship (e.g. `album`).
     name: Ident,
     /// The destination entity type (e.g. `Album`).
@@ -99,6 +97,7 @@ impl Parse for Rel {
             None
         };
         Ok(Rel {
+            attrs: vec![],
             name,
             destination,
             multiplicity,
@@ -109,11 +108,6 @@ impl Parse for Rel {
 }
 
 impl Rel {
-    /// Returns the destination entity type in lower case.
-    fn destination_lower(&self) -> Ident {
-        format_ident!("{}", self.destination.to_string().to_lowercase())
-    }
-
     fn is_optional_one(&self) -> bool {
         match self.multiplicity {
             Multiplicity::ZeroOrOne => true,
@@ -139,11 +133,17 @@ enum AttrOrRel {
 
 impl Parse for AttrOrRel {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        if input.peek(kw::rel) {
-            Ok(AttrOrRel::Rel(input.parse()?))
+        let attrs = input.call(syn::Attribute::parse_outer)?;
+        let mut item = if input.peek(kw::rel) {
+            AttrOrRel::Rel(input.parse()?)
         } else {
-            Ok(AttrOrRel::Attr(input.parse()?))
-        }
+            AttrOrRel::Attr(input.parse()?)
+        };
+        match item {
+            AttrOrRel::Attr(ref mut attr) => attr.attrs = attrs,
+            AttrOrRel::Rel(ref mut rel) => rel.attrs = attrs,
+        };
+        Ok(item)
     }
 }
 
@@ -157,6 +157,8 @@ impl Parse for AttrOrRel {
 /// );
 /// ```
 struct Entity {
+    /// Attributes.
+    attrs: Vec<syn::Attribute>,
     /// The name of the entity.
     name: Ident,
     /// Attributes and relationships.
@@ -190,13 +192,14 @@ impl Entity {
 
 impl Parse for Entity {
     fn parse(input: ParseStream) -> syn::Result<Self> {
+        let attrs = input.call(syn::Attribute::parse_outer)?;
         let name = input.parse()?;
         let content;
         parenthesized!(content in input);
         let items = Punctuated::parse_terminated(&content)?;
         // ends with a semicolon
         let _: Token![;] = input.parse()?;
-        Ok(Entity { name, items })
+        Ok(Entity { attrs, name, items })
     }
 }
 
@@ -211,6 +214,7 @@ impl Parse for Entity {
 /// );
 /// ```
 struct Store {
+    attrs: Vec<syn::Attribute>,
     /// Optional visibility.
     vis: Visibility,
     /// The name of the store. Declared with `store Name;`.
@@ -222,6 +226,7 @@ struct Store {
 impl Parse for Store {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         // Parse the `store Name;` directive.
+        let attrs = input.call(syn::Attribute::parse_outer)?;
         let vis = input.parse()?;
         let _: kw::store = input.parse()?;
         let name = input.parse()?;
@@ -233,6 +238,7 @@ impl Parse for Store {
             entities.push(input.parse()?);
         }
         Ok(Store {
+            attrs,
             vis,
             name,
             entities,
@@ -255,11 +261,24 @@ impl Store {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // CODEGEN
 
-/// Two-sided relation
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct RelEdge<'a> {
-    a: &'a Rel,
-    b: &'a Rel,
+fn generate_change_struct(store: &Store) -> TokenStream {
+    let mut tokens = TokenStream::new();
+    for entity in store.entities.iter() {
+        let name = &entity.name;
+        let added = format_ident!("{}Added", name);
+        let removed = format_ident!("{}Removed", name);
+        tokens.append_all(quote! {
+            #added(#name),
+            #removed(#name),
+        });
+    }
+
+    let name = format_ident!("{}Change", store.name);
+    quote! {
+        pub enum #name {
+            #tokens
+        }
+    }
 }
 
 ///
@@ -269,7 +288,6 @@ fn generate_entity_store_impls(
     out_tokens: &mut TokenStream,
     out_entity_impl: &mut TokenStream,
 ) -> Result<(), Error> {
-
     let mut checks_insert = vec![];
     let mut checks_remove = vec![];
     let mut upkeeps_insert = vec![];
@@ -426,44 +444,50 @@ fn generate_entity_store_impls(
         AttrOrRel::Attr(attr) => {
             let name = &attr.name;
             let ty = &attr.ty;
-            quote! {#name: #ty,}
+            quote! {
+                #name: #ty,
+            }
         }
         AttrOrRel::Rel(rel) => {
             let name = &rel.name;
             let ty = &rel.destination;
             // TODO: let the user choose the container
             match rel.multiplicity {
-                Multiplicity::ZeroOrOne => {
-                    quote! {#name: Option<#ty>,}
-                }
-                Multiplicity::One => {
-                    quote! {#name: #ty,}
-                }
-                Multiplicity::Many => {
-                    quote! {#name: Vec<#ty>,}
-                }
+                ZeroOrOne => quote! {
+                    #name: Option<#ty>,
+                },
+                One => quote! {
+                    #name: #ty,
+                },
+                Many => quote! {
+                    #name: Vec<#ty>,
+                },
             }
         }
     });
 
-    let entity_store = quote!{#CRATE::EntityStore::<#entity_ty>};
+    let entity_store = quote! {#CRATE::EntityStore::<#entity_ty>};
 
-    out_tokens.append_all(quote!{
+    out_tokens.append_all(quote! {
 
-        #[derive(Copy, Clone, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+        #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
         #[repr(transparent)]
-        #vis struct #entity_ty(#CRATE::slotmap::KeyData);
-        impl From<#CRATE::slotmap::KeyData> for #entity_ty {
-            fn from(k: #CRATE::slotmap::KeyData) -> Self {
-                #entity_ty(k)
+        #vis struct #entity_ty(::std::num::NonZeroU32);
+
+        impl #CRATE::Entity for #entity_ty {
+            type Row = #row_ty;
+            type Store = #store_ty;
+
+            fn to_u32(self) -> u32 {
+                self.0.get() - 1
             }
-        }
-        unsafe impl #CRATE::slotmap::Key for #entity_ty {
-            fn data(&self) -> #CRATE::slotmap::KeyData {
-                self.0
+
+            fn from_u32(i: u32) -> Self {
+                Self(unsafe { ::std::num::NonZeroU32::new_unchecked(i + 1) })
             }
         }
 
+        #[derive(Clone)]
         #vis struct #row_ty {
             #(#fields)*
         }
@@ -476,21 +500,16 @@ fn generate_entity_store_impls(
 
         impl ::std::ops::Index<#entity_ty> for #store_ty {
             type Output = #row_ty;
-            fn index(&self, idx: #entity_ty) -> &Self::Output {
-                &self.#entity_ty[idx]
+            fn index(&self, entity: #entity_ty) -> &Self::Output {
+                &self.#entity_ty[entity]
             }
         }
 
         impl ::std::ops::IndexMut<#entity_ty> for #store_ty {
-            fn index_mut(&mut self, idx: #entity_ty) -> &mut Self::Output {
-                &mut self.#entity_ty[idx]
+            fn index_mut(&mut self, entity: #entity_ty) -> &mut Self::Output {
+                &mut self.#entity_ty[entity]
             }
         }
-
-        impl #CRATE::Entity for #entity_ty {
-            type Row = #row_ty;
-        }
-
 
         impl #CRATE::EntityStore<#entity_ty> for #store_ty {
             fn insert(&mut self, data: #row_ty) -> Result<#entity_ty, #CRATE::Error> {
@@ -509,8 +528,20 @@ fn generate_entity_store_impls(
                 #(#upkeeps_remove)*
                 Ok(data)
             }
-            fn remove_unchecked(&mut self, index: #entity_ty) -> #row_ty {
-                self.#entity_ty.remove(index).expect("invalid index")
+            fn remove_unchecked(&mut self, entity: #entity_ty) -> #row_ty {
+                self.#entity_ty.remove(entity).expect("invalid ID")
+            }
+
+            fn delta<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = #CRATE::Delta<#entity_ty>> + 'a {
+                self.#entity_ty.delta(&other.#entity_ty)
+            }
+
+            fn iter<'a>(&'a self) -> impl Iterator<Item = (#entity_ty, &#row_ty)> + 'a {
+                self.#entity_ty.iter()
+            }
+
+            fn keys<'a>(&'a self) -> impl Iterator<Item = #entity_ty> + 'a {
+                self.#entity_ty.keys()
             }
         }
     });
@@ -523,6 +554,11 @@ fn generate_entity_store_impls(
         #vis fn data(self, db: &dyn #db_name) -> &#row_ty {
             &db.store().#entity_ty[self]
         }
+
+        /*/// Returns an iterator over all entities of this type.
+        #vis fn all<'a>(db: &'a dyn #db_name) -> impl Iterator<Item = #entity_ty> + 'a {
+            db.store().#entity_ty.keys()
+        }*/
     });
 
     // Getters & setters
@@ -532,12 +568,14 @@ fn generate_entity_store_impls(
                 let name = &attr.name;
                 let setter = format_ident!("set_{}", name);
                 let ty = &attr.ty;
+                let attrs = &attr.attrs;
                 out_entity_impl.append_all(quote! {
-                    #vis fn #name (self, db: &dyn #db_name) -> &#ty {
+                    #(#attrs)*
+                    #vis fn #name <DB: ?Sized + #db_name> (self, db: &DB) -> &#ty {
                         &db.store().#entity_ty[self].#name
                     }
 
-                    #vis fn #setter (self, db: &mut dyn #db_name, value: #ty) {
+                    #vis fn #setter <DB: ?Sized + #db_name> (self, db: &mut DB, value: #ty) {
                         db.store_mut().#entity_ty[self].#name = value;
                     }
                 });
@@ -545,19 +583,23 @@ fn generate_entity_store_impls(
             AttrOrRel::Rel(rel) => {
                 let name = &rel.name;
                 let ty = &rel.destination;
+                let attrs = &rel.attrs;
                 out_entity_impl.append_all(match rel.multiplicity {
                     ZeroOrOne => quote! {
-                        #vis fn #name (self, db: &dyn #db_name) -> Option<#ty> {
+                        #(#attrs)*
+                        #vis fn #name <DB: ?Sized + #db_name> (self, db: &DB) -> Option<#ty> {
                             db.store().#entity_ty[self].#name
                         }
                     },
                     One => quote! {
-                        #vis fn #name (self, db: &dyn #db_name) -> #ty {
+                        #(#attrs)*
+                        #vis fn #name <DB: ?Sized + #db_name> (self, db: &DB) -> #ty where {
                             db.store().#entity_ty[self].#name
                         }
                     },
                     Many => quote! {
-                        #vis fn #name<'a>(self, db: &'a dyn #db_name) -> &'a [#ty] {
+                        #(#attrs)*
+                        #vis fn #name <'a, DB: ?Sized + #db_name>(self, db: &'a DB) -> &'a [#ty] {
                             &db.store().#entity_ty[self].#name
                         }
                     },
@@ -759,20 +801,24 @@ pub(crate) fn generate_store(input: proc_macro::TokenStream) -> syn::Result<Toke
         });
     }
 
-    let entity_names = store.entities.iter().map(|entity| &entity.name);
     let vis = &store.vis;
 
     let store_fields = store.entities.iter().map(|entity| {
         let name = &entity.name;
-        let row_name = format_ident!("{}Row", name);
-        quote! {#name : #CRATE::slotmap::SlotMap<#name, #row_name>,}
+        //let row_name = format_ident!("{}Row", name);
+        quote! {#name : #CRATE::Table<#name>,}
     });
 
-    let crate_ = &CRATE;
+    let changes = generate_change_struct(&store);
+
+    let attrs = &store.attrs;
+
     let code = quote! {
+        #changes
 
-
-        #[derive(Default)]
+        #(#attrs)*
+        #[derive(Clone, Default)]
+        #[allow(non_snake_case)]
         #vis struct #store_name {
             #(#store_fields)*
         }
@@ -786,7 +832,7 @@ pub(crate) fn generate_store(input: proc_macro::TokenStream) -> syn::Result<Toke
         #tokens
 
         #vis trait #trait_name: #CRATE::HasStore<#store_name> {}
-        impl<DB> #trait_name for DB where DB: #CRATE::HasStore<#store_name> {}
+        impl<DB: ?Sized> #trait_name for DB where DB: #CRATE::HasStore<#store_name> {}
     };
 
     Ok(code)

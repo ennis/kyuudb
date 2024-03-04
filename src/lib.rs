@@ -1,13 +1,13 @@
-mod db_index;
 mod db;
-mod table;
-mod index_vec;
+mod db_index;
 mod error;
+mod index_vec;
+mod table;
 
+pub use db::{Database, Entity, EntityStore, HasStore, Query, RelOps, Rel, join};
 pub use db_index::{DbIndex, Index};
 pub use error::Error;
-pub use db::{HasStore, RelOps, EntityStore, Entity};
+pub use table::{Delta, Table};
 
-// Reexports
 #[doc(hidden)]
-pub use slotmap;
+pub use im;

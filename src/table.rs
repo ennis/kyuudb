@@ -1,78 +1,125 @@
-use slab::Slab;
-use slotmap::{new_key_type, SlotMap};
-use vec_map::VecMap;
-use crate::db_index::TableIndex;
-use crate::Index;
+use crate::Entity;
+use im::ordmap::{DiffItem, OrdMap};
+use std::ops::{Index, IndexMut};
 
-
-pub enum TableEvent {
-    Inserted(Index),
-    Removed(Index),
+#[derive(Clone)]
+struct Row<T> {
+    data: T,
+    revision: u32,
 }
 
-
-/*
-// One-to-one: VecMap<u32>, or store inline as an option
-// One-to-many: VecMap<Vec<u32>>, or store inline as a Vec<u32>
-
-pub struct OneToManyRelation {
-    rel: VecMap<Vec<u32>>,
-}
-
-impl OneToManyRelation {
-    pub fn new() -> OneToManyRelation {
-        OneToManyRelation {
-            rel: VecMap::new(),
-        }
+impl<T> PartialEq for Row<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.revision == other.revision
     }
 }
 
-/// Represents a one-to-many relation between two entities: one A to many Bs.
-impl OneToManyRelation {
-    pub fn insert(&mut self, db: &dyn Database, a: Index, b: Index) {
-        let a = a.to_usize();
-        let b = b.to_usize();
-        if a >= self.rel.len() {
-            self.rel.resize(a+1, Vec::new());
-        }
-        self.rel[a].push(b as u32);
-    }
+type Map<T: Entity> = OrdMap<u32, Row<T::Row>>;
 
-    /// Removes the specified A from the relation
-    pub fn remove(&mut self, db: &dyn Database, a: Index) {
-        // what do we do with the B's?
-        db.remove_one_to_many
-    }
-
-    /// Breaks the relation
-    pub fn remove_all(&self, db: &dyn Database) {
-        // what do we do with the B's?
-    }
+#[derive(Clone, Debug)]
+pub enum Delta<T> {
+    Insert(T),
+    Remove(T),
+    Update(T),
 }
 
-/// Represents a table.
-pub struct Table<V, DB: ?Sized> {
-    /// Index of this table in the database that holds it.
-    index: TableIndex,
-    /// Holds entity data.
-    data: Slab<V>,
+/// Stores entity data.
+#[derive(Clone)]
+pub struct Table<T: Entity> {
+    pub(crate) data: Map<T>,
+    next_id: u32,
 }
 
-
-
-impl<V, DB:?Sized> Table<V, DB> {
-    pub fn new(index: TableIndex) -> Table<V, DB> {
+impl<T: Entity> Table<T> {
+    pub fn new() -> Table<T> {
         Table {
-            index,
-            data: Slab::new(),
-            event_handlers: Vec::new(),
+            data: OrdMap::new(),
+            next_id: 0,
         }
+    }
+
+    pub fn insert(&mut self, data: T::Row) -> T {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.data.insert(id, Row { data, revision: 0 });
+        T::from_u32(id)
+    }
+
+    pub fn remove(&mut self, id: T) -> Option<T::Row> {
+        self.data.remove(&id.to_u32()).map(|row| row.data)
+    }
+
+    pub fn get(&self, id: T) -> Option<&T::Row> {
+        self.data.get(&id.to_u32()).map(|row| &row.data)
+    }
+
+    pub fn get_mut(&mut self, id: T) -> Option<&mut T::Row> {
+        if let Some(row) = self.data.get_mut(&id.to_u32()) {
+            row.revision += 1;
+            Some(&mut row.data)
+        } else {
+            None
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (T, &T::Row)> {
+        self.data
+            .iter()
+            .map(|(id, data)| (T::from_u32(*id), &data.data))
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.data.clear();
+    }
+
+    pub fn contains(&self, id: T) -> bool {
+        self.data.contains_key(&id.to_u32())
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = T> + '_ {
+        self.data.keys().map(|id| T::from_u32(*id))
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &T::Row> {
+        self.data.values().map(|row| &row.data)
+    }
+
+    pub fn next_id(&self) -> u32 {
+        self.next_id
+    }
+
+    pub fn delta<'a>(&'a self, prev: &'a Table<T>) -> impl Iterator<Item = Delta<T>> + 'a {
+        prev.data.diff(&self.data).map(|item| match item {
+            DiffItem::Add(k, _) => Delta::Insert(T::from_u32(*k)),
+            DiffItem::Update { old, .. } => Delta::Update(T::from_u32(*old.0)),
+            DiffItem::Remove(k, _) => Delta::Remove(T::from_u32(*k)),
+        })
     }
 }
 
-/// Trait implemented by databases that have a store of the specified type.
-pub trait HasStore<Store> {
-    fn store(&self) -> &Store;
-    fn store_mut(&mut self) -> &mut Store;
+impl<T: Entity> Index<T> for Table<T> {
+    type Output = T::Row;
+    fn index(&self, id: T) -> &Self::Output {
+        &self.data[&id.to_u32()].data
+    }
 }
-*/
+
+impl<T: Entity> IndexMut<T> for Table<T> {
+    fn index_mut(&mut self, id: T) -> &mut Self::Output {
+        self.get_mut(id).unwrap()
+    }
+}
+
+impl<T: Entity> Default for Table<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}

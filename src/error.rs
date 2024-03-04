@@ -1,4 +1,3 @@
-
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     /// Deletion of an entity was denied because of a non-empty relationship with a delete rule set to `Deny` .
