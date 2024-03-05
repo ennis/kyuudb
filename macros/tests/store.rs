@@ -1,4 +1,4 @@
-use kyuudb::{Delta, Entity, EntityStore, HasStore, join, Query, Rel};
+use kyuudb::{join, Delta, Entity, EntityStore, HasStore, Query, Rel};
 use kyuudb_macros::store;
 use std::io::Read;
 use std::iter::once;
@@ -64,6 +64,7 @@ impl HasStore<TrackDbStore> for Db {
     }
 }
 
+/*
 fn query_album_tracks<DB>(
     album_query: impl Query<DB, Item = Album> + Clone + 'static,
 ) -> impl Query<DB, Item = Track>
@@ -130,10 +131,12 @@ where
     }
 
     Q(album_query)
-}
+}*/
 
 struct Rel_Album_tracks;
 struct Rel_Track_album;
+struct Rel_Track_artist;
+struct Rel_Artist_tracks;
 
 impl Rel for Rel_Album_tracks {
     type Src = Album;
@@ -153,7 +156,25 @@ impl Rel for Rel_Track_album {
     }
 }
 
+impl Rel for Rel_Track_artist {
+    type Src = Track;
+    type Dst = Artist;
+    type Inverse = Rel_Artist_tracks;
+    fn targets(src: &TrackRow) -> impl Iterator<Item = Artist> + '_ {
+        once(src.artist)
+    }
+}
 
+impl Rel for Rel_Artist_tracks {
+    type Src = Artist;
+    type Dst = Track;
+    type Inverse = Rel_Track_artist;
+    fn targets(src: &ArtistRow) -> impl Iterator<Item = Track> + '_ {
+        src.tracks.iter().cloned()
+    }
+}
+
+/*
 // join on a many-to-one relationship, incremental on the right side
 macro_rules! decl_join {
     ([$store:ident] $f:ident ($left:ident . $left_rel:ident => $right:ident . $right_rel:ident) ) => {
@@ -232,10 +253,10 @@ macro_rules! decl_join {
             Join { query, in_fn }
         }
     };
-}
+}*/
 
-decl_join!([TrackDbStore] join_album_tracks(Album.tracks => Track.album));
-decl_join!([TrackDbStore] join_artist_tracks(Artist.tracks => Track.artist));
+//decl_join!([TrackDbStore] join_album_tracks(Album.tracks => Track.album));
+//decl_join!([TrackDbStore] join_artist_tracks(Artist.tracks => Track.artist));
 
 /*
 struct Join<A, B>(A, B);
@@ -416,40 +437,89 @@ fn test_structs_and_enums_01() {
     track_crazy_tonight.set_album(db, syrufit_over).unwrap();
 
     eprintln!("\n------\nAlbum tracks: \n------");
-    for track in query_album_tracks(Album::query_all()).iter(db) {
+    for ((album, album_row), (track, track_row)) in
+        join(Album::query_all(), Rel_Album_tracks, |x| x).iter(db)
+    {
         eprintln!(
             "[{}] {} ({}) ",
-            track.album(db).name(db),
-            track.name(db),
-            track.artist(db).name(db)
+            album_row.name,
+            track_row.name,
+            track_row.artist.name(db)
         );
     }
 
-    eprintln!("\n------\nUpdated album tracks: \n------");
-    for track in query_album_tracks(Album::query_all()).delta(db, &snapshot) {
+    eprintln!("\n------\nDelta album tracks: \n------");
+    for track in join(Album::query_all(), Rel_Album_tracks, |x| x).delta(db, &snapshot) {
         match track {
-            Delta::Insert(track) => eprintln!(
+            Delta::Insert(((album, album_row), (track, track_row))) => eprintln!(
                 "Insert: [{}] {} ({}) ",
-                track.album(db).name(db),
-                track.name(db),
-                track.artist(db).name(db)
+                album_row.name,
+                track_row.name,
+                track_row.artist.name(db)
             ),
-            Delta::Remove(track) => eprintln!(
+            Delta::Remove(((album, album_row), (track, track_row))) => eprintln!(
                 "Remove: [{}] {} ({}) ",
-                track.album(&snapshot).name(&snapshot),
-                track.name(&snapshot),
-                track.artist(&snapshot).name(&snapshot)
+                album_row.name,
+                track_row.name,
+                track_row.artist.name(&snapshot)
             ),
-            Delta::Update(track) => eprintln!(
+            Delta::Update {
+                old,
+                new: ((album, album_row), (track, track_row)),
+            } => eprintln!(
                 "Update: [{}] {} ({}) ",
-                track.album(db).name(db),
-                track.name(db),
-                track.artist(db).name(db)
+                album_row.name,
+                track_row.name,
+                track_row.artist.name(db)
             ),
         }
     }
 
-    // want tuples like:
+    // triple-join:
+
+    eprintln!("\n------\nDelta query artists: \n------");
+    for delta in join(
+        join(Album::query_all(), Rel_Album_tracks, |x| x),
+        Rel_Track_artist,
+        |(_, y)| y,
+    )
+    .delta(db, &snapshot)
+    {
+        match delta {
+            Delta::Insert((((album, album_row), (track, track_row)), (artist, artist_row))) => {
+                eprintln!(
+                    "Insert: [{}] {} ({}) ",
+                    album_row.name, track_row.name, artist_row.name
+                )
+            }
+            Delta::Remove((((album, album_row), (track, track_row)), (artist, artist_row))) => {
+                eprintln!(
+                    "Remove: [{}] {} ({}) ",
+                    album_row.name, track_row.name, artist_row.name
+                )
+            }
+            Delta::Update {
+                old,
+                new: (((album, album_row), (track, track_row)), (artist, artist_row)),
+            } => {
+                eprintln!(
+                    "Update: [{}] {} ({}) ",
+                    album_row.name, track_row.name, artist_row.name
+                )
+            }
+        }
+    }
+
+    eprintln!("------\nDelta artists: \n------");
+    for artist in Artist::query_all().delta(db, &snapshot) {
+        match artist {
+            Delta::Insert(artist) => eprintln!("Insert: {}", artist.1.name),
+            Delta::Remove(artist) => eprintln!("Remove: {}", artist.1.name),
+            Delta::Update { old, new } => eprintln!("Update: {}", new.1.name),
+        }
+    }
+
+    /*// want tuples like:
     // (group_index, album, track_group_index, track)
     eprintln!("\n------\nTitle of removed tracks: \n------");
     for track in query_album_tracks(Album::query_all())
@@ -567,5 +637,5 @@ fn test_structs_and_enums_01() {
         });
 
     // triple join: updated artists in updated albums
-    //eprintln!("\n------\nTriple join: updated artists in updated albums: \n------");
+    //eprintln!("\n------\nTriple join: updated artists in updated albums: \n------");*/
 }

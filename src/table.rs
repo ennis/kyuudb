@@ -17,10 +17,10 @@ impl<T> PartialEq for Row<T> {
 type Map<T: Entity> = OrdMap<u32, Row<T::Row>>;
 
 #[derive(Clone, Debug)]
-pub enum Delta<T> {
-    Insert(T),
-    Remove(T),
-    Update(T),
+pub enum Delta<V> {
+    Insert(V),
+    Remove(V),
+    Update { old: V, new: V },
 }
 
 /// Stores entity data.
@@ -96,11 +96,17 @@ impl<T: Entity> Table<T> {
         self.next_id
     }
 
-    pub fn delta<'a>(&'a self, prev: &'a Table<T>) -> impl Iterator<Item = Delta<T>> + 'a {
+    pub fn delta<'a>(
+        &'a self,
+        prev: &'a Table<T>,
+    ) -> impl Iterator<Item = Delta<(T, &'a T::Row)>> + 'a {
         prev.data.diff(&self.data).map(|item| match item {
-            DiffItem::Add(k, _) => Delta::Insert(T::from_u32(*k)),
-            DiffItem::Update { old, .. } => Delta::Update(T::from_u32(*old.0)),
-            DiffItem::Remove(k, _) => Delta::Remove(T::from_u32(*k)),
+            DiffItem::Add(k, v) => Delta::Insert((T::from_u32(*k), &v.data)),
+            DiffItem::Update { old, new } => Delta::Update {
+                old: (T::from_u32(*old.0), &old.1.data),
+                new: (T::from_u32(*new.0), &new.1.data),
+            },
+            DiffItem::Remove(k, v) => Delta::Remove((T::from_u32(*k), &v.data)),
         })
     }
 }

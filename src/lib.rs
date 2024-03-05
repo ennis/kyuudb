@@ -4,7 +4,7 @@ mod error;
 mod index_vec;
 mod table;
 
-pub use db::{Database, Entity, EntityStore, HasStore, Query, RelOps, Rel, join};
+pub use db::{join, Database, Entity, EntityStore, HasStore, Query, Rel, RelOps};
 pub use db_index::{DbIndex, Index};
 pub use error::Error;
 pub use table::{Delta, Table};

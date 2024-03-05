@@ -659,7 +659,9 @@ fn album_view(album: Query<Album> /* #0 */) -> impl Widget {
 
 // Conceptually, `impl Widget` is a `template` to update the tree from DB changes; it's not meant to change
 // meaning that there cannot be control flow in the function (it might as well be data)
-
-
-
 ```
+
+# Proposal: pointers to objects instead of IDs?
+
+No, instead, when querying, also return a pointer to the data; put the ID inside to minimize type complexity for joins.
+Reverse the entity trait to be on the row type instead

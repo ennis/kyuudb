@@ -532,7 +532,7 @@ fn generate_entity_store_impls(
                 self.#entity_ty.remove(entity).expect("invalid ID")
             }
 
-            fn delta<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = #CRATE::Delta<#entity_ty>> + 'a {
+            fn delta<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = #CRATE::Delta<(#entity_ty, &'a #row_ty)>> + 'a {
                 self.#entity_ty.delta(&other.#entity_ty)
             }
 

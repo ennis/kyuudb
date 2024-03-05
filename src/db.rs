@@ -19,35 +19,69 @@ impl RevIndex {
     }
 }
 
-
-pub fn join<DB, T, Q, R, FI>(query: Q, _rel: R, in_fn: FI) -> impl Query<DB, Item = (T, R::Dst)>
-    where
-        R: Rel,
-        DB: HasStore<<R::Src as Entity>::Store> + ?Sized,
-        Q: Query<DB, Item = T> + Clone + 'static,
-        T: Clone + 'static,
-        FI: Fn(T) -> R::Src + Clone + 'static,
+// (KS, (VS, _)) x Delta(KD, VD) -> Delta(KD, (VS, VD))
+// (KS, (VS, _)) x (KD, VD) -> (KD, (VD, (KS, (VS, _))))
+// (KS, (VS, _)) x Delta(KD, VD) -> Delta(KD, (VD, (KS, (VS, _))))
+/*
+pub fn join_delta<'a, T, IS, ID, R>(
+    left: IS,
+    right: ID,
+    _rel: R,
+) -> impl Iterator<Item = Delta<R::Dst, (&'a <R::Dst as Entity>::Row, IS::Item)>> + 'a
+where
+    R: Rel,
+    T: Clone,
+    IS: Iterator<Item = (R::Src, (&'a <R::Src as Entity>::Row, T))>,
+    ID: Iterator<Item = Delta<R::Dst, &'a <R::Dst as Entity>::Row>>,
 {
-    #[derive(Clone)]
-    struct Join<A, FI, R> {
+    left.flat_map(move |(left, (left_row, rest))| {
+        right.filter_map(move |d| match d {
+            Delta::Insert(right, right_row) if R::Inverse::contains(right_row, left) => {
+                Some(Delta::Insert(right, (right_row, (left, (left_row, rest)))))
+            }
+            Delta::Remove(right, right_row) if R::Inverse::contains(right_row, left) => {
+                Some(Delta::Remove(right, (right_row, (left, (left_row, rest)))))
+            }
+            Delta::Update { id, old, new } => {
+                let in_old = R::Inverse::contains(old, left);
+                let in_new = R::Inverse::contains(new, left);
+                if in_old && in_new {
+                    Some(Delta::Update {
+                        id: right,
+                        old: (old, (left, (left_row, rest.clone()))),
+                        new: (new, (left, (left_row, rest.clone()))),
+                    })
+                } else if in_old {
+                    Some(Delta::Remove(right, (old, (left, (left_row, rest)))))
+                } else if in_new {
+                    Some(Delta::Insert(right, (new, (left, (left_row, rest)))))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+    })
+
+    /*#[derive(Clone)]
+    struct Join<A, R> {
         query: A,
-        in_fn: FI,
         _r: PhantomData<R>,
     }
 
-    impl<DB, T, A, R, FI> Query<DB> for Join<A, FI, R>
-        where
-            R: Rel,
-            DB: HasStore<<R::Src as Entity>::Store> + ?Sized,
-            A: Query<DB, Item = T> + Clone + 'static,
-            T: Clone + 'static,
-            FI: Fn(T) -> R::Src + Clone + 'static,
+    impl<DB, T, Q, R, FI> Query<DB> for Join<Q, R>
+    where
+        R: Rel,
+        DB: HasStore<<R::Src as Entity>::Store> + ?Sized,
+        Q: Query<DB> + Clone + 'static,
+        T: Clone + 'static,
     {
-        type Item = (T, R::Dst);
+        type Key = R::Dst;
+        type Value<'a> = (Q::Value<'a>, <R::Dst as Entity>::Row);
+
 
         fn iter<'a>(self, db: &'a DB) -> impl Iterator<Item = (T, R::Dst)> + 'a {
-            self.query.iter(db).flat_map(move |left_val| {
-                let left = (self.in_fn)(left_val.clone());
+            self.query.iter(db).flat_map(move |(left, left_val)| {
                 R::targets(left.fetch(db)).map(move |v| (left_val.clone(), v))
             })
         }
@@ -99,17 +133,97 @@ pub fn join<DB, T, Q, R, FI>(query: Q, _rel: R, in_fn: FI) -> impl Query<DB, Ite
         query,
         in_fn,
         _r: PhantomData::<R>,
+    }*/
+}*/
+
+pub fn join<'a, Q, R, F, DB>(
+    query: Q,
+    _rel: R,
+    get_rel: F,
+) -> impl Query<'a, DB, Item = (Q::Item, (R::Dst, &'a <R::Dst as Entity>::Row))>
+where
+    Q: Query<'a, DB>,
+    Q::Item: Clone,
+    R: Rel,
+    F: Fn(Q::Item) -> (R::Src, &'a <R::Src as Entity>::Row) + 'static,
+    DB: HasStore<<R::Src as Entity>::Store> + ?Sized,
+{
+    #[derive(Clone)]
+    struct Join<Q, R, F> {
+        query: Q,
+        get_rel: F,
+        _r: PhantomData<R>,
+    }
+
+    impl<'a, Q, R, F, DB> Query<'a, DB> for Join<Q, R, F>
+    where
+        Q: Query<'a, DB>,
+        Q::Item: Clone,
+        R: Rel,
+        F: Fn(Q::Item) -> (R::Src, &'a <R::Src as Entity>::Row) + 'static,
+        DB: HasStore<<R::Src as Entity>::Store> + ?Sized,
+    {
+        type Item = (Q::Item, (R::Dst, &'a <R::Dst as Entity>::Row));
+
+        fn iter(self, db: &'a DB) -> impl Iterator<Item = Self::Item> + 'a {
+            self.query.iter(db).flat_map(move |item| {
+                let (_, left_row) = (self.get_rel)(item.clone());
+                R::targets(left_row).map(move |v| (item.clone(), (v, v.fetch(db))))
+            })
+        }
+
+        fn delta(self, db: &'a DB, prev: &'a DB) -> impl Iterator<Item = Delta<Self::Item>> + 'a {
+            self.query.iter(db).flat_map(move |item| {
+                let (left, left_row) = (self.get_rel)(item.clone());
+                // Might be good to store the delta in a vec instead of traversing the store multiple times
+                R::Dst::query_all()
+                    .delta(db, prev)
+                    .filter_map(move |d| match d {
+                        Delta::Insert(inserted) if R::Inverse::contains(inserted.1, left) => {
+                            Some(Delta::Insert((item.clone(), inserted)))
+                        }
+                        Delta::Remove(removed) if R::Inverse::contains(removed.1, left) => {
+                            Some(Delta::Remove((item.clone(), removed)))
+                        }
+                        Delta::Update { old, new } => {
+                            let in_old = R::Inverse::contains(old.1, left);
+                            let in_new = R::Inverse::contains(new.1, left);
+                            if in_old && in_new {
+                                Some(Delta::Update {
+                                    old: (item.clone(), old),
+                                    new: (item.clone(), new),
+                                })
+                            } else if in_old {
+                                Some(Delta::Remove((item.clone(), old)))
+                            } else if in_new {
+                                Some(Delta::Insert((item.clone(), new)))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    })
+            })
+        }
+    }
+
+    Join {
+        query,
+        get_rel,
+        _r: PhantomData::<R>,
     }
 }
 
-pub trait Query<DB: ?Sized> {
-    type Item;
+pub trait Query<'a, DB: ?Sized> {
+    type Item: 'a;
 
-    fn iter<'a>(self, db: &'a DB) -> impl Iterator<Item = Self::Item> + 'a;
+    /// Returns an iterator over all items produced by the query.
+    fn iter(self, db: &'a DB) -> impl Iterator<Item = Self::Item> + 'a;
 
-    fn delta<'a>(self, db: &'a DB, prev: &'a DB) -> impl Iterator<Item = Delta<Self::Item>> + 'a;
+    /// Returns an iterator over all changes to this query since a previous snapshot.
+    fn delta(self, db: &'a DB, prev: &'a DB) -> impl Iterator<Item = Delta<Self::Item>> + 'a;
 
-    fn map<U>(self, f: impl Fn(Self::Item, &DB) -> U + 'static) -> impl Query<DB, Item = U>
+    /*fn map<U>(self, f: impl Fn(Self::Key, &Self::Value, &DB) -> U + 'static) -> impl Query<DB, Item = U>
     where
         Self: Sized,
     {
@@ -136,38 +250,52 @@ pub trait Query<DB: ?Sized> {
             }
         }
         Map(self, f)
-    }
+    }*/
 
     /*/// Join on the specified relation.
-    fn join<R, T>(self, rel: R) -> impl Query<DB, Item = (Self::Item, R::Dst)>
+    fn join<R>(self, rel: R) -> impl Query<'a, DB, Item = (
+        R::Src,
+        &'a <R::Src as Entity>::Row,
+        R::Dst,
+        &'a <R::Dst as Entity>::Row,
+    )>
     where
         R: Rel,
-        DB: HasStore<<R::Src as Entity>::Store> + ?Sized,
-        Self: Sized,
+        DB: HasStore<<R::Src as Entity>::Store>,
+        Self::Item = (R::Src, &'a <R::Src as Entity>::Row),
     {
-        join(self, rel, in_fn)
+        join(self, rel)
     }*/
 }
 
+// Query = impl Iterator<(K,V)>, V: 'a
+// join combinator: Iterator<(KS,V)>, Iterator<(KD,V)>
+
+/*
 impl<DB, E> Query<DB> for E
 where
     E: Entity,
     DB: HasStore<E::Store>,
 {
-    type Item = E;
+    type Key = E;
+    type Value<'a> = &'a E::Row;
 
-    fn iter<'a>(self, db: &'a DB) -> impl Iterator<Item = E> + 'a {
-        std::iter::once(self)
+    fn iter<'a>(self, db: &'a DB) -> impl Iterator<Item = (E, &'a E::Row)> + 'a {
+        std::iter::once((self, self.fetch(db)))
     }
 
-    fn delta<'a>(self, db: &'a DB, prev: &'a DB) -> impl Iterator<Item = Delta<E>> + 'a {
+    fn delta<'a>(
+        self,
+        db: &'a DB,
+        prev: &'a DB,
+    ) -> impl Iterator<Item = Delta<E, &'a E::Row>> + 'a {
         db.store().delta(&prev.store()).filter(move |e| match e {
-            Delta::Insert(e) => self == *e,
-            Delta::Remove(e) => self == *e,
-            Delta::Update(e) => self == *e,
+            Delta::Insert(id, _) => self == *id,
+            Delta::Remove(id, _) => self == *id,
+            Delta::Update { id, .. } => self == *id,
         })
     }
-}
+}*/
 
 pub trait Rel {
     type Src: Entity;
@@ -191,24 +319,28 @@ pub trait Entity: Copy + Eq + fmt::Debug + 'static {
     fn to_u32(self) -> u32;
     fn from_u32(id: u32) -> Self;
 
-    fn query_all<DB>() -> impl Query<DB, Item = Self> + Copy
+    fn query_all<'a, DB>() -> impl Query<'a, DB, Item = (Self, &'a Self::Row)> + Copy
     where
         DB: ?Sized + HasStore<Self::Store>,
     {
         #[derive(Copy, Clone)]
         struct Q<T>(PhantomData<fn() -> T>);
-        impl<DB, T> Query<DB> for Q<T>
+        impl<'a, DB, T> Query<'a, DB> for Q<T>
         where
             T: Entity,
             DB: ?Sized + HasStore<T::Store>,
         {
-            type Item = T;
+            type Item = (T, &'a T::Row);
 
-            fn iter<'a>(self, db: &'a DB) -> impl Iterator<Item = T> + 'a {
-                db.store().keys()
+            fn iter(self, db: &'a DB) -> impl Iterator<Item = Self::Item> + 'a {
+                db.store().iter()
             }
 
-            fn delta<'a>(self, db: &'a DB, prev: &'a DB) -> impl Iterator<Item = Delta<T>> + 'a {
+            fn delta(
+                self,
+                db: &'a DB,
+                prev: &'a DB,
+            ) -> impl Iterator<Item = Delta<Self::Item>> + 'a {
                 db.store().delta(prev.store())
             }
         }
@@ -216,11 +348,11 @@ pub trait Entity: Copy + Eq + fmt::Debug + 'static {
     }
 
     /// Returns an iterator over all entity rows in the store.
-    fn fetch_all<DB>(db: &DB) -> impl Iterator<Item = (Self, &Self::Row)> + '_
+    fn fetch_all<DB>(db: &DB) -> impl Iterator<Item = (Self, (&Self::Row, ()))> + '_
     where
         DB: ?Sized + HasStore<Self::Store>,
     {
-        db.store().iter()
+        db.store().iter().map(|(id, row)| (id, (row, ())))
     }
 
     /// Returns an iterator over all entity IDs in the store.
@@ -238,8 +370,17 @@ pub trait Entity: Copy + Eq + fmt::Debug + 'static {
     {
         &db.store()[self]
     }
-}
 
+    fn delta<'a, DB>(
+        db: &'a DB,
+        prev: &'a DB,
+    ) -> impl Iterator<Item = Delta<(Self, &'a Self::Row)>> + 'a
+    where
+        DB: ?Sized + HasStore<Self::Store>,
+    {
+        db.store().delta(prev.store())
+    }
+}
 
 /// Operations for a specific entity type on a store.
 pub trait EntityStore<T: Entity>: ops::Index<T, Output = T::Row> + 'static {
@@ -247,7 +388,7 @@ pub trait EntityStore<T: Entity>: ops::Index<T, Output = T::Row> + 'static {
     fn check_remove(&self, index: T) -> Result<(), Error>;
     fn remove(&mut self, index: T) -> Result<T::Row, Error>;
     fn remove_unchecked(&mut self, index: T) -> T::Row;
-    fn delta<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = Delta<T>> + 'a;
+    fn delta<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = Delta<(T, &'a T::Row)>> + 'a;
     fn iter(&self) -> impl Iterator<Item = (T, &T::Row)>;
     fn keys<'a>(&'a self) -> impl Iterator<Item = T> + 'a;
 }
