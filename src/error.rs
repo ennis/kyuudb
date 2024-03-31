@@ -15,4 +15,12 @@ pub enum Error {
     /// E.g. trying to remove a mandatory target from a `ToOne` relation.
     #[error("the operation would result in a relationship with too few targets")]
     RelationshipTooFewTargets,
+
+    /// The operation contains a reference to an entity that does not exist.
+    #[error("the operation contains a reference to a non-existent entity")]
+    ForeignKeyViolation,
+
+    /// The entity could not be found.
+    #[error("the entity could not be found")]
+    EntityNotFound,
 }

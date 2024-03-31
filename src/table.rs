@@ -1,3 +1,4 @@
+use crate::db::EntityId;
 use crate::Entity;
 use im::ordmap::{DiffItem, OrdMap};
 use std::ops::{Index, IndexMut};
@@ -14,7 +15,7 @@ impl<T> PartialEq for Row<T> {
     }
 }
 
-type Map<T: Entity> = OrdMap<u32, Row<T::Row>>;
+type Map<T: Entity> = OrdMap<u32, Row<T>>;
 
 #[derive(Clone, Debug)]
 pub enum Delta<V> {
@@ -38,22 +39,23 @@ impl<T: Entity> Table<T> {
         }
     }
 
-    pub fn insert(&mut self, data: T::Row) -> T {
-        let id = self.next_id;
+    pub fn insert_at(&mut self, data: T) -> T::Id {
+        assert_eq!(data.id(), self.next_id());
+        let id = data.id();
         self.next_id += 1;
-        self.data.insert(id, Row { data, revision: 0 });
-        T::from_u32(id)
+        self.data.insert(id.to_u32(), Row { data, revision: 0 });
+        id
     }
 
-    pub fn remove(&mut self, id: T) -> Option<T::Row> {
+    pub fn remove(&mut self, id: T::Id) -> Option<T> {
         self.data.remove(&id.to_u32()).map(|row| row.data)
     }
 
-    pub fn get(&self, id: T) -> Option<&T::Row> {
+    pub fn get(&self, id: T::Id) -> Option<&T> {
         self.data.get(&id.to_u32()).map(|row| &row.data)
     }
 
-    pub fn get_mut(&mut self, id: T) -> Option<&mut T::Row> {
+    pub fn get_mut(&mut self, id: T::Id) -> Option<&mut T> {
         if let Some(row) = self.data.get_mut(&id.to_u32()) {
             row.revision += 1;
             Some(&mut row.data)
@@ -62,10 +64,8 @@ impl<T: Entity> Table<T> {
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (T, &T::Row)> {
-        self.data
-            .iter()
-            .map(|(id, data)| (T::from_u32(*id), &data.data))
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.data.iter().map(|(id, data)| &data.data)
     }
 
     pub fn len(&self) -> usize {
@@ -80,46 +80,43 @@ impl<T: Entity> Table<T> {
         self.data.clear();
     }
 
-    pub fn contains(&self, id: T) -> bool {
+    pub fn contains(&self, id: T::Id) -> bool {
         self.data.contains_key(&id.to_u32())
     }
 
-    pub fn keys(&self) -> impl Iterator<Item = T> + '_ {
-        self.data.keys().map(|id| T::from_u32(*id))
+    pub fn keys(&self) -> impl Iterator<Item = T::Id> + '_ {
+        self.data.keys().map(|id| T::Id::from_u32(*id))
     }
 
-    pub fn values(&self) -> impl Iterator<Item = &T::Row> {
+    pub fn values(&self) -> impl Iterator<Item = &T> {
         self.data.values().map(|row| &row.data)
     }
 
-    pub fn next_id(&self) -> u32 {
-        self.next_id
+    pub fn next_id(&self) -> T::Id {
+        T::Id::from_u32(self.next_id)
     }
 
-    pub fn delta<'a>(
-        &'a self,
-        prev: &'a Table<T>,
-    ) -> impl Iterator<Item = Delta<(T, &'a T::Row)>> + 'a {
+    pub fn delta<'a>(&'a self, prev: &'a Table<T>) -> impl Iterator<Item = Delta<&'a T>> + 'a {
         prev.data.diff(&self.data).map(|item| match item {
-            DiffItem::Add(k, v) => Delta::Insert((T::from_u32(*k), &v.data)),
+            DiffItem::Add(k, v) => Delta::Insert(&v.data),
             DiffItem::Update { old, new } => Delta::Update {
-                old: (T::from_u32(*old.0), &old.1.data),
-                new: (T::from_u32(*new.0), &new.1.data),
+                old: &old.1.data,
+                new: &new.1.data,
             },
-            DiffItem::Remove(k, v) => Delta::Remove((T::from_u32(*k), &v.data)),
+            DiffItem::Remove(k, v) => Delta::Remove(&v.data),
         })
     }
 }
 
-impl<T: Entity> Index<T> for Table<T> {
-    type Output = T::Row;
-    fn index(&self, id: T) -> &Self::Output {
+impl<T: Entity> Index<T::Id> for Table<T> {
+    type Output = T;
+    fn index(&self, id: T::Id) -> &Self::Output {
         &self.data[&id.to_u32()].data
     }
 }
 
-impl<T: Entity> IndexMut<T> for Table<T> {
-    fn index_mut(&mut self, id: T) -> &mut Self::Output {
+impl<T: Entity> IndexMut<T::Id> for Table<T> {
+    fn index_mut(&mut self, id: T::Id) -> &mut Self::Output {
         self.get_mut(id).unwrap()
     }
 }

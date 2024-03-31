@@ -1,7 +1,10 @@
-use crate::Index;
+use crate::{Index, Table};
 use crate::{Delta, Error};
 use std::marker::PhantomData;
 use std::{fmt, mem, ops};
+use std::collections::Bound;
+use std::ops::RangeBounds;
+use im::OrdMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash)]
 #[repr(transparent)]
@@ -19,201 +22,6 @@ impl RevIndex {
     }
 }
 
-// (KS, (VS, _)) x Delta(KD, VD) -> Delta(KD, (VS, VD))
-// (KS, (VS, _)) x (KD, VD) -> (KD, (VD, (KS, (VS, _))))
-// (KS, (VS, _)) x Delta(KD, VD) -> Delta(KD, (VD, (KS, (VS, _))))
-/*
-pub fn join_delta<'a, T, IS, ID, R>(
-    left: IS,
-    right: ID,
-    _rel: R,
-) -> impl Iterator<Item = Delta<R::Dst, (&'a <R::Dst as Entity>::Row, IS::Item)>> + 'a
-where
-    R: Rel,
-    T: Clone,
-    IS: Iterator<Item = (R::Src, (&'a <R::Src as Entity>::Row, T))>,
-    ID: Iterator<Item = Delta<R::Dst, &'a <R::Dst as Entity>::Row>>,
-{
-    left.flat_map(move |(left, (left_row, rest))| {
-        right.filter_map(move |d| match d {
-            Delta::Insert(right, right_row) if R::Inverse::contains(right_row, left) => {
-                Some(Delta::Insert(right, (right_row, (left, (left_row, rest)))))
-            }
-            Delta::Remove(right, right_row) if R::Inverse::contains(right_row, left) => {
-                Some(Delta::Remove(right, (right_row, (left, (left_row, rest)))))
-            }
-            Delta::Update { id, old, new } => {
-                let in_old = R::Inverse::contains(old, left);
-                let in_new = R::Inverse::contains(new, left);
-                if in_old && in_new {
-                    Some(Delta::Update {
-                        id: right,
-                        old: (old, (left, (left_row, rest.clone()))),
-                        new: (new, (left, (left_row, rest.clone()))),
-                    })
-                } else if in_old {
-                    Some(Delta::Remove(right, (old, (left, (left_row, rest)))))
-                } else if in_new {
-                    Some(Delta::Insert(right, (new, (left, (left_row, rest)))))
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        })
-    })
-
-    /*#[derive(Clone)]
-    struct Join<A, R> {
-        query: A,
-        _r: PhantomData<R>,
-    }
-
-    impl<DB, T, Q, R, FI> Query<DB> for Join<Q, R>
-    where
-        R: Rel,
-        DB: HasStore<<R::Src as Entity>::Store> + ?Sized,
-        Q: Query<DB> + Clone + 'static,
-        T: Clone + 'static,
-    {
-        type Key = R::Dst;
-        type Value<'a> = (Q::Value<'a>, <R::Dst as Entity>::Row);
-
-
-        fn iter<'a>(self, db: &'a DB) -> impl Iterator<Item = (T, R::Dst)> + 'a {
-            self.query.iter(db).flat_map(move |(left, left_val)| {
-                R::targets(left.fetch(db)).map(move |v| (left_val.clone(), v))
-            })
-        }
-
-        fn delta<'a>(
-            self,
-            db: &'a DB,
-            prev: &'a DB,
-        ) -> impl Iterator<Item = Delta<(T, R::Dst)>> + 'a {
-            self.query.iter(db).flat_map(move |left_val| {
-                let left = (self.in_fn)(left_val.clone());
-                // Might be good to store the delta in a vec instead of traversing the store multiple times
-                R::Dst::query_all()
-                    .delta(db, prev)
-                    .filter_map(move |d| match d {
-                        Delta::Insert(right) if R::Inverse::contains(right.fetch(db), left) => {
-                            Some(Delta::Insert(right))
-                        }
-                        Delta::Remove(right) if R::Inverse::contains(right.fetch(prev), left) => {
-                            Some(Delta::Remove(right))
-                        }
-                        Delta::Update(right) => {
-                            let old_data = right.fetch(prev);
-                            let new_data = right.fetch(db);
-                            let in_old = R::Inverse::contains(old_data, left);
-                            let in_new = R::Inverse::contains(new_data, left);
-                            if in_old && in_new {
-                                Some(Delta::Update(right))
-                            } else if in_old {
-                                Some(Delta::Remove(right))
-                            } else if in_new {
-                                Some(Delta::Insert(right))
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    })
-                    .map(move |d| match d {
-                        Delta::Insert(r) => Delta::Insert((left_val.clone(), r)),
-                        Delta::Remove(r) => Delta::Remove((left_val.clone(), r)),
-                        Delta::Update(r) => Delta::Update((left_val.clone(), r)),
-                    })
-            })
-        }
-    }
-
-    Join {
-        query,
-        in_fn,
-        _r: PhantomData::<R>,
-    }*/
-}*/
-
-pub fn join<'a, Q, R, F, DB>(
-    query: Q,
-    _rel: R,
-    get_rel: F,
-) -> impl Query<'a, DB, Item = (Q::Item, (R::Dst, &'a <R::Dst as Entity>::Row))>
-where
-    Q: Query<'a, DB>,
-    Q::Item: Clone,
-    R: Rel,
-    F: Fn(Q::Item) -> (R::Src, &'a <R::Src as Entity>::Row) + 'static,
-    DB: HasStore<<R::Src as Entity>::Store> + ?Sized,
-{
-    #[derive(Clone)]
-    struct Join<Q, R, F> {
-        query: Q,
-        get_rel: F,
-        _r: PhantomData<R>,
-    }
-
-    impl<'a, Q, R, F, DB> Query<'a, DB> for Join<Q, R, F>
-    where
-        Q: Query<'a, DB>,
-        Q::Item: Clone,
-        R: Rel,
-        F: Fn(Q::Item) -> (R::Src, &'a <R::Src as Entity>::Row) + 'static,
-        DB: HasStore<<R::Src as Entity>::Store> + ?Sized,
-    {
-        type Item = (Q::Item, (R::Dst, &'a <R::Dst as Entity>::Row));
-
-        fn iter(self, db: &'a DB) -> impl Iterator<Item = Self::Item> + 'a {
-            self.query.iter(db).flat_map(move |item| {
-                let (_, left_row) = (self.get_rel)(item.clone());
-                R::targets(left_row).map(move |v| (item.clone(), (v, v.fetch(db))))
-            })
-        }
-
-        fn delta(self, db: &'a DB, prev: &'a DB) -> impl Iterator<Item = Delta<Self::Item>> + 'a {
-            self.query.iter(db).flat_map(move |item| {
-                let (left, left_row) = (self.get_rel)(item.clone());
-                // Might be good to store the delta in a vec instead of traversing the store multiple times
-                R::Dst::query_all()
-                    .delta(db, prev)
-                    .filter_map(move |d| match d {
-                        Delta::Insert(inserted) if R::Inverse::contains(inserted.1, left) => {
-                            Some(Delta::Insert((item.clone(), inserted)))
-                        }
-                        Delta::Remove(removed) if R::Inverse::contains(removed.1, left) => {
-                            Some(Delta::Remove((item.clone(), removed)))
-                        }
-                        Delta::Update { old, new } => {
-                            let in_old = R::Inverse::contains(old.1, left);
-                            let in_new = R::Inverse::contains(new.1, left);
-                            if in_old && in_new {
-                                Some(Delta::Update {
-                                    old: (item.clone(), old),
-                                    new: (item.clone(), new),
-                                })
-                            } else if in_old {
-                                Some(Delta::Remove((item.clone(), old)))
-                            } else if in_new {
-                                Some(Delta::Insert((item.clone(), new)))
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    })
-            })
-        }
-    }
-
-    Join {
-        query,
-        get_rel,
-        _r: PhantomData::<R>,
-    }
-}
-
 pub trait Query<'a, DB: ?Sized> {
     type Item: 'a;
 
@@ -222,50 +30,6 @@ pub trait Query<'a, DB: ?Sized> {
 
     /// Returns an iterator over all changes to this query since a previous snapshot.
     fn delta(self, db: &'a DB, prev: &'a DB) -> impl Iterator<Item = Delta<Self::Item>> + 'a;
-
-    /*fn map<U>(self, f: impl Fn(Self::Key, &Self::Value, &DB) -> U + 'static) -> impl Query<DB, Item = U>
-    where
-        Self: Sized,
-    {
-        struct Map<Q, F>(Q, F);
-
-        impl<Q, U, F, DB> Query<DB> for Map<Q, F>
-        where
-            Q: Query<DB>,
-            F: Fn(Q::Item, &DB) -> U + 'static,
-            DB: ?Sized,
-        {
-            type Item = U;
-
-            fn iter<'a>(self, db: &'a DB) -> impl Iterator<Item = U> + 'a {
-                self.0.iter(db).map(move |x| (self.1)(x, db))
-            }
-
-            fn delta<'a>(self, db: &'a DB, prev: &'a DB) -> impl Iterator<Item = Delta<U>> + 'a {
-                self.0.delta(db, prev).map(move |x| match x {
-                    Delta::Insert(x) => Delta::Insert((self.1)(x, db)),
-                    Delta::Remove(x) => Delta::Remove((self.1)(x, prev)),
-                    Delta::Update(x) => Delta::Update((self.1)(x, db)),
-                })
-            }
-        }
-        Map(self, f)
-    }*/
-
-    /*/// Join on the specified relation.
-    fn join<R>(self, rel: R) -> impl Query<'a, DB, Item = (
-        R::Src,
-        &'a <R::Src as Entity>::Row,
-        R::Dst,
-        &'a <R::Dst as Entity>::Row,
-    )>
-    where
-        R: Rel,
-        DB: HasStore<<R::Src as Entity>::Store>,
-        Self::Item = (R::Src, &'a <R::Src as Entity>::Row),
-    {
-        join(self, rel)
-    }*/
 }
 
 // Query = impl Iterator<(K,V)>, V: 'a
@@ -297,101 +61,242 @@ where
     }
 }*/
 
+/*
+/// Helper trait for relations.
 pub trait Rel {
-    type Src: Entity;
-    type Dst: Entity<Store = <Self::Src as Entity>::Store>;
+    type Store;
+    type Src: EntityId;
+    type Dst: EntityId;
     type Inverse: Rel<Src = Self::Dst, Dst = Self::Src, Inverse = Self>;
-    fn targets(src: &<Self::Src as Entity>::Row) -> impl Iterator<Item = Self::Dst> + '_;
-    fn contains(src: &<Self::Src as Entity>::Row, dst: Self::Dst) -> bool {
-        Self::targets(src).any(|t| t == dst)
-    }
-}
 
-/// Represents an entity ID.
-///
-/// Usually it's implemented as a newtype for a `u32` index.
-pub trait Entity: Copy + Eq + fmt::Debug + 'static {
-    /// Data type associated with the entity.
-    type Row: Clone + 'static;
-    /// Store type associated with the entity.
-    type Store: EntityStore<Self>;
+    /// Returns whether a new relation targeting the given destination can be inserted.
+    fn may_insert(store: &Self::Store, dst: Self::Dst) -> Result<(), Error>;
 
-    fn to_u32(self) -> u32;
-    fn from_u32(id: u32) -> Self;
+    /// Tries to insert a new relation.
+    fn try_insert(
+        store: &mut Self::Store,
+        src: Self::Src,
+        dst: Self::Dst,
+    ) -> Result<(), Error>;
 
-    fn query_all<'a, DB>() -> impl Query<'a, DB, Item = (Self, &'a Self::Row)> + Copy
-    where
-        DB: ?Sized + HasStore<Self::Store>,
-    {
-        #[derive(Copy, Clone)]
-        struct Q<T>(PhantomData<fn() -> T>);
-        impl<'a, DB, T> Query<'a, DB> for Q<T>
-        where
-            T: Entity,
-            DB: ?Sized + HasStore<T::Store>,
-        {
-            type Item = (T, &'a T::Row);
+    /// Tries to remove a relation.
+    fn remove(
+        store: &mut Self::Store,
+        src: Self::Src,
+        dst: Self::Dst,
+    ) -> Result<(), Error>;
+}*/
 
-            fn iter(self, db: &'a DB) -> impl Iterator<Item = Self::Item> + 'a {
-                db.store().iter()
+#[macro_export]
+macro_rules! impl_rel_N_to_1 {
+    ($rel:ident, $store:ident, $src:ident, $src_id:ident, $fk:ident, $dst:ident, $dst_id:ident, $inv_rel:ident, $index:ident) => {
+        struct $rel;
+        struct $inv_rel;
+
+        impl $rel {
+            fn may_insert(store: &$store, dst: $dst_id) -> Result<(), $crate::Error> {
+                Ok(())
             }
 
-            fn delta(
-                self,
-                db: &'a DB,
-                prev: &'a DB,
-            ) -> impl Iterator<Item = Delta<Self::Item>> + 'a {
-                db.store().delta(prev.store())
+            fn try_insert(
+                store: &mut $store,
+                src: $src_id,
+                dst: $dst_id,
+            ) -> Result<(), $crate::Error> {
+                let prev_dst = ::std::mem::replace(&mut store.$src[src].$fk, dst);
+                store.$index.remove((prev_dst, src), ());
+                store.$index.insert((dst, src), ());
+                Ok(())
+            }
+
+            fn remove(
+                _store: &mut <$src as $crate::Entity>::Store,
+                _src: $src,
+                _dst: $dst,
+            ) -> Result<(), $crate::Error> {
+                Err($crate::Error::RelationshipDeniedDelete)
             }
         }
-        Q(PhantomData)
-    }
 
-    /// Returns an iterator over all entity rows in the store.
-    fn fetch_all<DB>(db: &DB) -> impl Iterator<Item = (Self, (&Self::Row, ()))> + '_
-    where
-        DB: ?Sized + HasStore<Self::Store>,
-    {
-        db.store().iter().map(|(id, row)| (id, (row, ())))
-    }
+        impl $crate::Rel for $inv_rel {
+            type Src = $dst;
+            type Dst = $src;
+            type Inverse = $rel;
 
-    /// Returns an iterator over all entity IDs in the store.
-    fn all<DB>(db: &DB) -> impl Iterator<Item = Self> + '_
-    where
-        DB: ?Sized + HasStore<Self::Store>,
-    {
-        db.store().keys()
-    }
+            fn targets(
+                store: &<$src as $crate::Entity>::Store,
+                src: $dst,
+            ) -> impl Iterator<Item = $src> + '_ {
+                store
+                    .$index
+                    .range((src, $src::MIN)..(src, $src::MAX))
+                    .map(|(_, v)| v)
+            }
 
-    /// Fetches the entity row from the store.
-    fn fetch<DB>(self, db: &DB) -> &Self::Row
-    where
-        DB: ?Sized + HasStore<Self::Store>,
-    {
-        &db.store()[self]
-    }
+            fn may_insert(
+                store: &<$src as $crate::Entity>::Store,
+                dst: $src,
+            ) -> Result<(), $crate::Error> {
+                Err($crate::Error::RelationshipDeniedDelete)
+            }
 
-    fn delta<'a, DB>(
-        db: &'a DB,
-        prev: &'a DB,
-    ) -> impl Iterator<Item = Delta<(Self, &'a Self::Row)>> + 'a
-    where
-        DB: ?Sized + HasStore<Self::Store>,
-    {
-        db.store().delta(prev.store())
-    }
+            fn try_insert(
+                store: &mut <$src as $crate::Entity>::Store,
+                src: $dst,
+                dst: $src,
+            ) -> Result<(), $crate::Error> {
+                $rel::try_insert(store, dst, src)
+            }
+
+            fn remove(
+                _store: &mut <$src as $crate::Entity>::Store,
+                _src: $dst,
+                _dst: $src,
+            ) -> Result<(), $crate::Error> {
+                Err($crate::Error::RelationshipDeniedDelete)
+            }
+        }
+    };
 }
 
+#[macro_export]
+macro_rules! index_01_to_1 {
+    ($rel:ident, $src:ident,  $fk:ident, $dst:ident, $inv_rel:ident, $index:ident) => {
+        struct $rel;
+        struct $inv_rel;
+
+        impl $crate::Rel for $rel {
+            type Src = $src;
+            type Dst = $dst;
+            type Inverse = $inv_rel;
+
+            fn targets(
+                store: &<$src as $crate::Entity>::Store,
+                src: $src,
+            ) -> impl Iterator<Item = $dst> + '_ {
+                ::std::iter::once(store[src].$fk)
+            }
+
+            fn may_insert(
+                store: &<$src as $crate::Entity>::Store,
+                dst: $dst,
+            ) -> Result<(), $crate::Error> {
+                if store.$index.contains_key(dst) {
+                    return Err($crate::Error::RelationshipTooManyTargets);
+                }
+                Ok(())
+            }
+
+            fn try_insert(
+                store: &mut <$src as $crate::Entity>::Store,
+                src: $src,
+                dst: $dst,
+            ) -> Result<(), $crate::Error> {
+                if store.$index.contains_key(dst) {
+                    return Err($crate::Error::RelationshipTooManyTargets);
+                }
+                let prev_dst = ::std::mem::replace(&mut store[src].$fk, dst);
+                store.$index.remove(prev_dst);
+                store.$index.insert(dst, src);
+                Ok(())
+            }
+
+            fn remove(
+                _store: &mut <$src as $crate::Entity>::Store,
+                _src: $src,
+                _dst: $dst,
+            ) -> Result<(), $crate::Error> {
+                Err($crate::Error::RelationshipDeniedDelete)
+            }
+        }
+
+        impl $crate::Rel for $inv_rel {
+            type Src = $dst;
+            type Dst = $src;
+            type Inverse = $rel;
+
+            fn targets(
+                store: &<$src as $crate::Entity>::Store,
+                src: $dst,
+            ) -> impl Iterator<Item = $src> + '_ {
+                store.$index.get(&src)
+            }
+
+            fn may_insert(
+                store: &<$src as $crate::Entity>::Store,
+                dst: $src,
+            ) -> Result<(), $crate::Error> {
+                Err($crate::Error::RelationshipDeniedDelete)
+            }
+
+            fn try_insert(
+                store: &mut <$src as $crate::Entity>::Store,
+                src: $dst,
+                dst: $src,
+            ) -> Result<(), $crate::Error> {
+                $rel::try_insert(store, dst, src)
+            }
+
+            fn remove(
+                _store: &mut <$src as $crate::Entity>::Store,
+                _src: $dst,
+                _dst: $src,
+            ) -> Result<(), $crate::Error> {
+                Err($crate::Error::RelationshipDeniedDelete)
+            }
+        }
+    };
+}
+
+/*
+// E.g. FkIndex<Track, Album>
+
+/// (Internal) Index for a non-unique foreign key relation.
+struct RelIndex<A, B>(OrdMap<(A,B),()>);
+
+/// (Internal) Index for a unique foreign key relation.
+struct RelIndexUnique<K,V>(OrdMap<K,V>);
+
+impl<K, V> RelIndex<K, V> where K: Ord, V: Ord {
+    fn insert(&mut self, k: K, v: V) {
+        self.0.insert((k,v), ());
+    }
+    fn remove(&mut self, k: K, v: V) {
+        self.0.remove(&(k,v));
+    }
+    fn contains_key(&self, k: K) -> bool {
+        self.0.contains_key(&(k,..))
+    }
+    fn get(&self, k: K) -> impl Iterator<Item = V> + '_ {
+        self.0.range((k,..)).map(|(_,v)| v)
+    }
+    fn range<R>(&self, range: R) -> impl Iterator<Item = (K,V)> + '_ where R: RangeBounds<K> {
+        self.0.range(range)
+    }
+}*/
+
+/// Entity index.
+pub trait EntityId: Copy + Eq + fmt::Debug + 'static {
+    fn from_u32(id: u32) -> Self;
+    fn to_u32(self) -> u32;
+}
+
+/// Represents an entity.
+///
+/// Usually it's implemented as a newtype for a `u32` index.
+pub trait Entity: 'static + Clone {
+    type Id: EntityId;
+    fn id(&self) -> Self::Id;
+}
+
+/*
 /// Operations for a specific entity type on a store.
-pub trait EntityStore<T: Entity>: ops::Index<T, Output = T::Row> + 'static {
-    fn insert(&mut self, data: T::Row) -> Result<T, Error>;
-    fn check_remove(&self, index: T) -> Result<(), Error>;
-    fn remove(&mut self, index: T) -> Result<T::Row, Error>;
-    fn remove_unchecked(&mut self, index: T) -> T::Row;
-    fn delta<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = Delta<(T, &'a T::Row)>> + 'a;
-    fn iter(&self) -> impl Iterator<Item = (T, &T::Row)>;
-    fn keys<'a>(&'a self) -> impl Iterator<Item = T> + 'a;
-}
+pub trait EntityStore<T: Entity>: ops::Index<T::Id, Output = T> + 'static {
+    fn insert(&mut self, f: impl FnOnce(T::Id) -> T) -> Result<T::Id, Error>;
+    fn remove(&mut self, index: T::Id) -> Result<T, Error>;
+    fn delta<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = Delta<&'a T>> + 'a;
+    fn iter<'a>(&'a self) -> impl Iterator<Item = &'a T>;
+}*/
 
 /// Trait implemented by databases that hold a specific store type.
 pub trait HasStore<Store> {
@@ -399,81 +304,108 @@ pub trait HasStore<Store> {
     fn store_mut(&mut self) -> &mut Store;
 }
 
-/// Helper trait for relation attributes (`Option<T>` for optional to-one relations, `Vec<T>` for to-many relations).
-pub trait RelOps {
-    type Index: Copy + Eq + fmt::Debug;
-    fn is_full(&self) -> bool;
-    fn is_empty(&self) -> bool;
-    fn insert(&mut self, index: Self::Index);
-    fn remove(&mut self, index: Self::Index);
-    fn contains(&self, index: Self::Index) -> bool;
+pub trait Relation {
+    type Key;
+    type Value;
 }
 
-impl<T: Copy + Eq + fmt::Debug> RelOps for Option<T> {
-    type Index = T;
-
-    fn is_full(&self) -> bool {
-        self.is_some()
+/// Represents an operation on a store when an entity of a specific type is modified.
+///
+/// There are triggers are in charge of:
+/// - enforcing unique constraints
+/// - updating indices
+/// - enforcing integrity rules on deletion, like "delete cascade" (delete all related entities when an entity is deleted).
+pub trait Trigger<DB: ?Sized, R: Relation> {
+    /// Called before an entity is inserted.
+    fn before_insert(&self, db: &DB, inserting: &R::Value) -> Result<(), Error> {
+        Ok(())
     }
 
-    fn is_empty(&self) -> bool {
-        self.is_none()
+    /// Called after an entity is inserted.
+    fn after_insert(&self, db: &mut DB, inserted: &R::Value) -> Result<(), Error> {
+        Ok(())
     }
 
-    fn insert(&mut self, index: Self::Index) {
-        *self = Some(index);
+    /// Called when an entity is about to be deleted.
+    fn before_delete(&self, db: &DB, deleting: &R::Value) -> Result<(), Error> {
+        Ok(())
     }
 
-    fn remove(&mut self, index: Self::Index) {
-        if let Some(prev) = *self {
-            assert_eq!(prev, index, "inconsistent index");
-        }
-        *self = None;
-    }
-
-    fn contains(&self, index: Self::Index) -> bool {
-        self == &Some(index)
+    /// Called after an entity is deleted.
+    fn after_delete(&self, db: &mut DB, deleted: &R::Value) -> Result<(), Error> {
+        Ok(())
     }
 }
 
-impl<T: Copy + Eq + fmt::Debug> RelOps for Vec<T> {
-    type Index = T;
 
-    fn is_full(&self) -> bool {
-        false
-    }
-
-    fn is_empty(&self) -> bool {
-        self.is_empty()
-    }
-
-    fn insert(&mut self, index: Self::Index) {
-        if !<[_]>::contains(self, &index) {
-            self.push(index);
-        }
-    }
-
-    fn remove(&mut self, index: Self::Index) {
-        if let Some(pos) = self.iter().position(|x| *x == index) {
-            self.swap_remove(pos);
-        }
-    }
-
-    fn contains(&self, index: Self::Index) -> bool {
-        <[_]>::contains(self, &index)
-    }
-}
 
 /// Operations on a database type.
 pub trait Database: Send + 'static {
-    /// Creates a snapshot of the database.
-    ///
-    /// This supposed to be cheap so you can use it to implement an undo/redo system.
-
     /// Rolls back the database to the given revision.
     fn rollback(&self, index: RevIndex);
 }
 
+
+/// Operations on relation indices.
+pub trait RelIndex {
+    /// The child entity.
+    type Key;
+    /// The referenced entity.
+    type Value;
+
+    fn get(&self, key: Self::Key) -> impl Iterator<Item = Self::Value> + '_;
+}
+
+// Foreign-key index for entity A referencing B: OrdMap<(B,A),()>,
+// Foreign-key index for entity A referencing B, with unique constraint: OrdMap<B,A>,
+
+/*
+impl<K,V> RelIndex for OrdMap<(K,V),()> where K: Ord, V: Ord {
+    type Key = K;
+    type Value = V;
+
+    fn get(&self, key: &K) -> impl Iterator<Item = &V> + '_ {
+        self.range((key,..)).map(|(_,v)| v)
+    }
+}*/
+
+/*
+// A <- B.a
+fn join2_delta_helper<A,B,DB>(db: &DB, prev: &DB) {
+    let a_delta =  db.a.delta(&prev.a);
+    let b_delta =  db.b.delta(&prev.b);
+
+    let index = &db.index;
+
+    let mut joined = im::OrdMap::<(A::Id, B::Id), Delta<(&A, &B)>>::new();
+
+    // A x Delta(B)
+    for (_,b) in b_delta {
+        match b {
+            Delta::Insert(b) => {
+                let a = db.a.get(b.a);
+                joined.insert((a.id, b.id), Delta::Insert((a, b)));
+            }
+            Delta::Remove(b) => {
+                let a = prev.a.get(b.a);
+                joined.insert((a.id, b.id), Delta::Remove((a, b)));
+            }
+            Delta::Update { old, new } => {
+                let old_a = db.a.get(old.a);
+                let new_a = if old.a != new.a {
+                    db.a.get(new.a)
+                } else {
+                    old_a
+                };
+                joined.insert((old.a, old.id), Delta::Remove((a, old)));
+                joined.insert((old.b, Delta::Insert((a, new)));
+            }
+        }
+    }
+
+
+}
+*/
 /*
 store! {
     store ExtendedTrackDb : TrackDb;

@@ -665,3 +665,304 @@ fn album_view(album: Query<Album> /* #0 */) -> impl Widget {
 
 No, instead, when querying, also return a pointer to the data; put the ID inside to minimize type complexity for joins.
 Reverse the entity trait to be on the row type instead
+
+
+# Three options for storing relations
+
+A. Separate tables for each attribute
+-> No; too much overhead
+
+B. Non-relation attributes in the same table, relations in separate tables (a.k.a. junction tables)
+-> additional lookups necessary on joins
+-> advantage: can delta on items added to relations
+
+C. All relations stored inline, except many-to-many relations
+-> many different code paths
+
+D. All relations stored inline, including many-to-many relations
+
+
+Idea: joins operate on "complete" rows, which are composed of the entity ID + a reference to the content
+
+
+# Evolution
+
+```
+    pub store TrackDb;
+
+    Album(
+        name: String,
+        rel album_artist: Artist,
+        year: u32,
+    );
+
+    Track(
+        name: String,
+        rel artist: Artist,
+        rel album: Album
+    );
+
+    Playlist(
+        name: String,
+    );  
+
+    Artist(
+        name: String,
+    );
+    
+    // External relation
+    rel PlaylistTracks(Playlist, Track);  // equivalent of putting the relation in `Playlist`
+```
+
+Issue: `rel` are stored inline, but `rel*` use junction tables. The row types are different even though they "look" the same in the schema.
+
+`rel` introduces a foreign-key relation.
+An index is created (`Index_Album_Track_album<(Album, Track) -> ()>`). This index is updated when a track is added.
+
+`rel*` introduces a to-many foreign-key relation.
+This creates one relation table and an index table:
+`Rel_Playlist_Track_tracks<(Playlist,Track) -> ()>`: tracks in each playlist (authoritative)
+`Index_Playlist_Track_tracks<(Track,Playlist) -> ()>`: playlists that each track is in
+
+Specifying the inverse relation?
+
+
+
+
+## Iteration
+
+## Joins
+
+```
+// Returns tuples (&'a Album, &'a Track) joined on the `Track.album` relation
+join!( Album, Track by Track.album )
+
+// query over album -> &'a Album
+// join with relation
+
+```
+
+
+Joins are like pattern matching:
+
+`album @ Album { id, name, .. }, Track { album: id, .. }`
+
+Join on `album.id` (primary key) and `track.album` (foreign key).
+Delta join: union of `Album x Delta(Track) + Delta(Album) x Track`
+
+Duplicates?
+E.g. adding album and adding a track in that album:
+
+
+
+### Types of joins
+
+* Joins on a one-to-one or one-to-many relations
+* Joins on foreign-key relations have special optimizations for incremental evaluation
+
+
+
+```
+// Iteration
+for album @ Album { id, name, .. } in albums { 
+  for Track { .. } in index!(Track, album).iter(store, id) { // index query; doesn't matter that there's a relation
+     // ... 
+  } 
+}
+
+// Delta query
+
+// DV = Lnew*DR - Lprev*dR + DL*Rnew - dL*Rprev
+
+for delta in albums.delta() {   
+  match delta {
+    Added(..) => {      // D+R
+    }
+    Removed(..) => {    // D-R
+      
+    }
+    Updated(..) => {    // D-R, D+R
+    }
+  }
+}
+
+```
+
+
+## Indices
+
+    // Index for foreign keys:
+    Map<(FK,S)>
+    // Index for foreign keys:
+    Map<FK -> S>
+
+```rust
+trait RelIndex<K,V> {
+  fn check(&self, k: K, v: V) -> bool;
+}
+
+```
+  
+
+# Datalog-like
+
+No "foreign keys", instead relations are in separate tables
+Makes the logic easier to implement, but can be costly (one extra lookup for joins).
+
+Q: Why is it cleaner?
+A: Because it removes an indirection level: before, we had entities, and inside entities, relations
+   The goal is to minimize the number of concepts and put them on the same level
+
+joins: album @ Album { id: album_id, name, .. } & track @ Track { id: track_id, name: track_name } & TrackAlbum(track_id, album_id)
+Is there a way to make the integrity constraints more "explicit", and more "principled"?
+
+Since the relations are immutable, perform the change, then check the constraints
+If the constraints are not satisfied, revert to the previous state
+    
+Alternative to on delete rules: have the user handle the deletion of related entities
+(+) more flexible: no need for predefined behaviors (cascade, nullify, delete) -> users update the table themselves
+(+) more explicit
+(+) integrity is still checked after insertion, if there's a problem, revert the changes
+(-) more error-prone: user may forget to write the deletion cascade code
+(-) less extensible: another inheriting store would need to know when a referenced entity is deleted, like a "trigger"
+
+
+Issue: datalog by itself has nothing to do with "integrity constraints" or "delete rules"
+
+Idea: delete rules are just a special case of "triggers"
+E.g. when a table has a foreign-key relation, register a "trigger" on the foreign table that deletes / nullifies the FK.
+
+A trigger would look something like this:
+
+```rust
+trait Trigger {
+    type Store;
+    type Entity;
+    //fn before_insert(&self, store: )
+    fn before_delete(&self, store: &Self::Store, deleting: Self::Entity::Id) -> Result<(), Error>;
+    fn after_delete(&self, store: &mut Self::Store, deleted: Self::Entity::Id) -> Result<(), Error>;
+}
+
+
+impl Trigger for FK_Track_Album_DeleteCascade {
+    fn on_delete(&self, store: &mut Store, deleted: AlbumId) {
+        let album_tracks = fk_index!(store:Track.album).get(deleted).collect::<Vec<_>>();
+        for t in album_tracks {
+            store.remove(t);
+        }
+    }
+}
+
+```
+
+It's different from datalog rules because they can also update user-modifiable tables (the extensional database).
+Issue: it's not declarative anymore, and algorithms can't rely on the fact that referential integrity is preserved. 
+
+Tentative design:
+- entities are stored in B+Trees, with the primary key as the key
+- each foreign-key ref to an entity has an associated index
+- unique constraints are implemented as indices
+- triggers are run before/after insertion/deletion to ensure integrity
+
+See also:
+- inclusion dependencies
+
+## Cost of OrdMaps?
+
+- Memory-heavy (chunks are duplicated on every update)
+- Can't experiment with alternative data structures (vecs, hashmaps, etc.)
+- diffs are not exactly free
+
+Alternative:
+- the history: a big sequence of modifications (insertions, retractions)
+- can play forwards, backwards
+
+Issue: sometimes there can be lots of intermediate states that we don't want to keep in the log
+(e.g. the position of a control point being dragged => we only care about the states before and after the gesture)
+
+Q: in the history, should we track modifications to individual attributes, or only whole rows?
+
+## Modeling individual attributes
+
+Main use case: string & array-valued attribute pooling. 
+Since we want undo, might as well allocate strings and arrays in an append-only pool.
+
+Issue: currently, when declaring an entity in the schema, it is expected that the data is stored and accessed via structs
+that are declared exactly the same as the entity.
+
+Q: Maybe this shouldn't be the case? 
+A: In most cases, required attributes should be stored next to each other in the entity record. 
+
+It makes no sense to split the attributes among different tables if all of them are required:
+* it increases memory overhead
+* it increases the number of lookups
+* it makes deleting entities harder because we need to remove all related attributes
+
+## Tentative
+- Model data relational-style: entities with required attributes; all attributes of an entity are stored in row structs
+  - arrays and strings may be allocated in special pools?
+- Changes are tracked per-attribute
+- Use mutable BTreeMaps for the indices: it's important that they support range queries 
+- Changes to the same attribute and the same entity within the same revision are coalesced
+
+## Diffs
+Q: what kind of diffs do we want? 
+A: Diffs of the form:
+
+```rust
+// Holds value
+enum Change<K,V> {
+  Insert(K,V),
+  Remove(K,V)
+}
+
+// Holds pointer to immutable data
+enum Change<K,V> {
+  Insert(K, *const V),
+  Remove(K, *const V),
+}
+```
+
+Since data is immutable, can store rows in pools with stable addresses. 
+In theory, can replace foreign keys with pointers to data (saves a lookup).
+However, iteration on the main index is slower since the data is a pointer away from the index structure instead of directly within.
+
+In databases: clustered VS non-clustered indices.
+
+    Clustered indexes sort and store the data rows in the table or view based on their key values.
+
+    Nonclustered indexes have a structure separate from the data rows. 
+    A nonclustered index contains the nonclustered index key values and each key value entry has a pointer to the data row that contains the key value.
+    The pointer from an index row in a nonclustered index to a data row is called a row locator. 
+    The structure of the row locator depends on whether the data pages are stored in a heap or a clustered table. For a heap, a row locator is a pointer to the row. For a clustered table, the row locator is the clustered index key.
+
+
+Basically, sort the data physically in the order in which you're going to iterate over it.
+E.g. for tracks, sort by album.
+
+Table is TrackId -> Track
+But is stored in the DB as (Album, TrackId) -> Track
+
+Q: What should the entity type be? Cloneable?
+A: maybe not directly the type stored in the database: we may want to store raw pointers
+also, it shouldn't have setters (impossible since it may hold borrows)
+
+So, in terms of types, we have:
+- the user-facing "entity" type (e.g. Album)
+- the primary key type (e.g. AlbumId)
+- the internal row type (e.g. AlbumRow)
+- the initializer type used when inserting rows
+
+## UI trees from deltas
+
+    for album in albums {
+        for track in album.tracks(db) {
+            // ...
+            // every item here is associated to two IDs: album and track
+
+            // album remove -> delete (album, ..)
+            // (track,album) removed -> delete (album, track)
+
+            // album added
+        }
+    }

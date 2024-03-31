@@ -1,56 +1,485 @@
-use kyuudb::{join, Delta, Entity, EntityStore, HasStore, Query, Rel};
+#![feature(macro_metavar_expr)]
+
+use kyuudb::db::Trigger;
+use kyuudb::im::{HashMap, OrdMap, OrdSet};
+use kyuudb::{Delta, Error, HasStore, Query};
 use kyuudb_macros::store;
+use paste::paste;
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::ffi::c_void;
+use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::iter::once;
 use std::marker::PhantomData;
+use std::num::NonZeroU32;
+use std::ops::{Bound, RangeBounds};
 
+/*
 store! {
     /// Database schema for a music library.
     pub store TrackDb;
 
     /// Represents an album.
-    Album(
-        /// Name of the album.
+    Album {
+        #[key]
+        id: AlbumId,
         name: String,
-        /// Album artist.
-        rel album_artist: Artist,
-        /// Year of release.
-        year: u32,
-        /// Tracks in the album.
-        rel tracks: Track*.album,
-
-        // if you don't want to track the tracks, you can use a query instead
-        // query tracks: Track* = Track.album == this
-    );
-
+        year: u32
+    }
 
     /// Represents a track of an album.
-    Track(
-        /// Name of the track.
+    Track {
+        #[key]
+        id: TrackId,
         name: String,
-        /// Track artist.
-        rel artist: Artist.tracks,
-        /// Album the track is part of.
-        rel album: Album.tracks
-    );
+        ref album: AlbumId,
+        ref artist: ArtistId
+    }
 
     /// Represents a playlist.
-    Playlist(
-        /// Name of the playlist.
+    Playlist {
+        #[key]
+        id: PlaylistId,
         name: String,
-        /// Tracks in the playlist.
-        rel tracks: Track*
-    );
+        ref tracks: TrackId* (unique)
+    }
 
-    Artist(
-        /// Name of the artist.
-        name: String,
-        /// All songs by the artist.
-        rel tracks: Track*.artist
-    );
+    Artist {
+        #[key]
+        id: ArtistId,
+        name: String
+    }
+
+    /*PlaylistTracks {
+        #[key]
+        playlist: PlaylistId,
+        #[key]
+        track: TrackId
+    }*/
+}
+*/
+
+pub trait Idx: Copy + Ord + Hash + fmt::Debug + Default {
+    const MIN: Self;
+    const MAX: Self;
+
+    fn to_u32(self) -> u32;
+    fn from_u32(id: u32) -> Self;
+    fn dummy() -> Self;
+    fn next(self) -> Self;
+}
+
+macro_rules! make_id {
+    ($name:ident) => {
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+        #[repr(transparent)]
+        pub struct $name(pub(crate) NonZeroU32);
+
+        impl Idx for $name {
+            const MIN: $name = $name(NonZeroU32::MIN);
+            const MAX: $name = $name(NonZeroU32::MAX);
+
+            fn to_u32(self) -> u32 {
+                self.0.get() - 1
+            }
+
+            fn from_u32(id: u32) -> $name {
+                $name(unsafe { NonZeroU32::new_unchecked(id + 1) })
+            }
+
+            fn dummy() -> $name {
+                $name(unsafe { NonZeroU32::new_unchecked(u32::MAX) })
+            }
+
+            fn next(self) -> $name {
+                $name::from_u32(self.to_u32() + 1)
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                $name::from_u32(0)
+            }
+        }
+    };
+}
+
+
+make_id!(AlbumId);
+make_id!(TrackId);
+make_id!(PlaylistId);
+make_id!(ArtistId);
+
+trait Entity {
+    type Key: Idx;
+    fn key(&self) -> Self::Key;
 }
 
 #[derive(Clone)]
+struct Album {
+    id: AlbumId,
+    name: String,
+    year: u32,
+    album_artist: Option<ArtistId>,
+}
+
+impl Entity for Album {
+    type Key = AlbumId;
+    fn key(&self) -> AlbumId {
+        self.id
+    }
+}
+
+#[derive(Clone)]
+struct Track {
+    id: TrackId,
+    name: String,
+    album: AlbumId,
+    artist: ArtistId,
+}
+
+impl Entity for Track {
+    type Key = TrackId;
+    fn key(&self) -> TrackId {
+        self.id
+    }
+}
+
+#[derive(Clone)]
+struct Playlist {
+    id: PlaylistId,
+    name: String,
+}
+
+impl Entity for Playlist {
+    type Key = PlaylistId;
+    fn key(&self) -> PlaylistId {
+        self.id
+    }
+}
+
+#[derive(Clone)]
+struct Artist {
+    id: ArtistId,
+    name: String,
+}
+
+impl Entity for Artist {
+    type Key = ArtistId;
+    fn key(&self) -> ArtistId {
+        self.id
+    }
+}
+
+#[derive(Clone)]
+enum ChangeKind<V> {
+    Inserted(V),
+    Removed(V),
+}
+
+#[derive(Clone)]
+struct Change<V> {
+    timestamp: u64,
+    kind: ChangeKind<V>,
+}
+
+struct ChangeSet<V> {
+    changes: Vec<Change<V>>,
+}
+
+impl<V> ChangeSet<V> {
+    fn since(&self, timestamp: u64) -> impl Iterator<Item = &ChangeKind<V>> {
+        let last = self.changes.iter().rposition(|change| change.timestamp < timestamp).map(|i| i + 1).unwrap_or(0);
+        self.changes[last..].iter().map(|change| &change.kind)
+    }
+
+    fn push(&mut self, timestamp: u64, change: ChangeKind<V>) {
+        self.changes.push(Change { timestamp, kind: change });
+    }
+}
+
+#[derive(Default)]
+struct DbStore4 {
+    timestamp: u64,
+
+    Album_next_id: AlbumId,
+    Track_next_id: TrackId,
+    Playlist_next_id: PlaylistId,
+    Artist_next_id: ArtistId,
+
+    clustered_Track: BTreeMap<(AlbumId, TrackId), Track>,
+    pk_Track: BTreeMap<TrackId, (AlbumId, TrackId)>,
+    change_Track: ChangeSet<Track>,
+
+    pk_Album: BTreeMap<AlbumId, Album>,
+    change_Album: ChangeSet<Album>,
+
+    pk_Artist: BTreeMap<ArtistId, Artist>,
+    change_Artist: ChangeSet<Artist>,
+
+    pk_Playlist: BTreeMap<PlaylistId, Playlist>,
+    fk_Track_album: BTreeMap<(AlbumId, TrackId), ()>,
+    fk_Track_artist: BTreeMap<(ArtistId, TrackId), ()>,
+    fk_Album_album_artist: BTreeMap<(ArtistId, AlbumId), ()>,
+
+    multi_Playlist_tracks: BTreeMap<(PlaylistId, TrackId), ()>, // 16 bytes per entry
+    multi_Playlist_tracks_inv: BTreeMap<(TrackId, PlaylistId), ()>, // 16 bytes per entry
+}
+
+impl DbStore4 {
+    fn next(&mut self) -> u64 {
+        self.timestamp += 1;
+        self.timestamp - 1
+    }
+}
+
+macro_rules! __ignore {
+    ($($tts:tt)*) => {};
+}
+
+fn range_helper<A: Idx, B: Idx>(
+    a: impl RangeBounds<A>,
+) -> (Bound<(A, B)>, Bound<(A, B)>) {
+    let start = match a.start_bound() {
+        Bound::Included(x) => Bound::Included((*x, B::MIN)),
+        Bound::Excluded(x) => Bound::Excluded((*x, B::MAX)),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    let end = match a.end_bound() {
+        Bound::Included(x) => Bound::Included((*x, B::MAX)),
+        Bound::Excluded(x) => Bound::Excluded((*x, B::MIN)),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    (start, end)
+}
+
+macro_rules! impl_rel {
+    (
+        $r:ident
+        primary key ($pk:ident: $pkty:ty)
+        foreign keys ($($fk:ident : $fk_ref:ident),*)
+        nullable foreign keys ($($nullfk:ident : $nullfk_ref:ident),*)
+        $(cluster ($($cluster_attr:ident),*))?
+        delete cascade ($($cascade:ident . $cascade_fk:ident),*)
+        delete nullify ($($nullify:ident . $nullify_fk:ident),*)
+        delete deny ($($deny:ident . $deny_fk:ident),*)
+    ) => {
+        // $r: Relation (e.g. Album, Track)
+        // $fk: Foreign key (e.g. album, artist)
+        // $fk_ref: Referenced entity (e.g. Album, Artist)
+        // $cascade.$cascade_fk: foreign-key references to $r with cascade delete (e.g. Track.album)
+        // $nullify.$nullify_fk: foreign-key references to $r with nullify delete
+        // $deny.$deny_fk: foreign-key references to $r with deny delete
+
+        paste! {
+            impl $r {
+                fn before_insert(db: &DbStore4, inserting: &$r) -> Result<(), Error> {
+                    // check validity of primary key
+                    if db.[<pk_ $r>].contains_key(&inserting.$pk) {
+                        return Err(Error::EntityNotFound);
+                    }
+                    // check that foreign keys are valid
+                    $( if !db.[< pk_ $fk_ref >].contains_key(&inserting.$fk) { return Err(Error::ForeignKeyViolation);} )*
+                    $( if let Some(fk) = inserting.$nullfk { if !db.[< pk_ $nullfk_ref >].contains_key(&fk) { return Err(Error::ForeignKeyViolation); }} )*
+                    Ok(())
+                }
+
+                fn before_delete(db: &DbStore4, deleted: &$r) -> Result<(), Error> {
+                    // check that cascading deletes are valid
+                    $(
+                        for ((_, v),_) in db.[< fk_ $cascade _ $cascade_fk >].range(range_helper(deleted.$pk..=deleted.$pk)) {
+                            $cascade::before_delete(db, $cascade::fetch(db, *v).expect("foreign key integrity error"))?;
+                        }
+                    )*
+                    // deny delete if there's any referencing entity
+                    $(
+                        if db.[< fk_ $deny _ $deny_fk >].contains_key(&deleted.$pk) {
+                            return Err(Error::RelationshipDeniedDelete);
+                        }
+                    )*
+                    Ok(())
+                }
+
+
+                fn fetch(db: &DbStore4, key: $pkty) -> Option<&$r> {
+                    let v = db.[<pk_ $r>].get(&key)?;
+                    $(
+                        __ignore!($($cluster_attr)*);
+                        let v = db.[<clustered_ $r>].get(&v)?;
+                    )?
+                    Some(v)
+                }
+
+                fn fetch_mut(db: &mut DbStore4, key: $pkty) -> Option<&mut $r> {
+                    let v = db.[<pk_ $r>].get_mut(&key)?;
+                    $(
+                        __ignore!($($cluster_attr)*);
+                        let v = db.[<clustered_ $r>].get_mut(&v)?;
+                    )?
+                    Some(v)
+                }
+
+                fn all(db: &DbStore4) -> impl Iterator<Item = &$r> {
+                    let iter = db.[<pk_ $r>].values();
+                    $(
+                        __ignore!($($cluster_attr)*);
+                        let iter = db.[<clustered_ $r>].values();
+                    )?
+                    iter
+                }
+
+                fn delete(db: &mut DbStore4, key: $pkty) -> Result<$r, Error> {
+                    let v = Self::fetch(db, key).ok_or(Error::EntityNotFound)?;
+                    Self::before_delete(db, v)?;
+                    let deleted = Self::delete_inner(db, key)?;
+                    Ok(deleted)
+                }
+
+                fn delete_inner(db: &mut DbStore4, key: $pkty) -> Result<$r, Error> {
+                    let timestamp = db.timestamp;
+                    let deleted = db.[<pk_ $r>].remove(&key).unwrap();
+                    $(
+                        __ignore!($($cluster_attr)*);
+                        let deleted = db.[<clustered_ $r>].remove(&deleted).unwrap();
+                    )?
+
+                    // record the change
+                    db.[<change_ $r>].push(Change {
+                        timestamp,
+                        kind: ChangeKind::Removed(deleted.clone()),
+                    });
+
+                     // update foreign key indices
+                    $( db.[< fk_ $r _ $fk >].remove(&(deleted.$fk, deleted.id));)*
+                    $( if let Some(fk) = deleted.$nullfk { db.[< fk_ $r _ $nullfk >].remove(&(fk, deleted.id)); })*
+
+                    // delete cascade
+                    $(
+                        let to_delete = db.[< fk_ $cascade _ $cascade_fk >].range(range_helper(deleted.$pk..=deleted.$pk)).map(|((_, v),_)| *v).collect::<Vec<_>>();
+                        for v in to_delete {
+                            // skip before_delete since it's already been done
+                            $cascade::delete_inner(db, v)?;
+                        }
+                    )*
+                    // nullify
+                    $(
+                        let to_nullify = db.[< fk_ $nullify _ $nullify_fk >].range(range_helper(deleted.$pk..=deleted.$pk)).map(|((_, v),_)| *v).collect::<Vec<_>>();
+                        for v in to_nullify {
+                            $nullify::fetch_mut(db, v).unwrap().$nullify_fk = None;
+                            // TODO update index
+                        }
+                    )*
+
+                    Ok(deleted)
+                }
+
+                fn insert(db: &mut DbStore4, f: impl FnOnce($pkty) -> $r) -> Result<$pkty, Error> {
+                    let id = db.[<$r _next_id>].next();
+                    let val = f(id);
+
+                    Self::before_insert(db, &val)?;
+
+                    // first, update foreign key indices
+                    $( db.[< fk_ $r _ $fk >].insert((val.$fk, val.$pk), ()); )*
+                    $( if let Some(fk) = val.$nullfk { db.[< fk_ $r _ $nullfk >].insert((fk, val.$pk), ()); } )*
+
+                    // record the change
+                    let timestamp = db.timestamp;
+                    db.[<change_ $r>].push(Change {
+                        timestamp,
+                        kind: ChangeKind::Inserted(val.clone()),
+                    });
+
+                    // insert
+                    let pk = val.$pk;
+                    $(
+                        // insert into custom clustered index
+                        let key = ($(val.$cluster_attr,)*);
+                        db.[<clustered_ $r>].insert(key, val);
+                        let val = key;
+                    )?
+
+                    // insert into pk index
+                    db.[<pk_ $r>].insert(pk, val);
+                    db.[<$r _next_id>] = id;
+                    Ok(id)
+                }
+
+
+                // foreign key navigation
+                $(
+                    fn $fk(self, db: &DbStore4) -> Option<&$fk_ref> {
+                        $fk_ref::fetch(db, self.$fk)
+                    }
+                )*
+
+                fn update(db: &mut DbStore4, key: $pkty, f: impl FnOnce(&mut $r)) -> Result<(), Error> {
+                    // update is delete + insert
+                    let mut val = $r::delete(db, key)?;
+                    f(&mut val);
+                    $r::insert(db, |_| val)?;
+                    Ok(())
+                }
+            }
+
+            impl $pkty {
+                fn delete(self, db: &mut DbStore4) -> Result<$r, Error> {
+                    $r::delete(db, self)
+                }
+
+                fn fetch(self, db: &DbStore4) -> Option<&$r> {
+                    $r::fetch(db, self)
+                }
+
+                // foreign key setters
+                $(
+                    fn [<set_ $fk>](self, db: &mut DbStore4, $fk: <$fk_ref as Entity>::Key) -> Result<(), Error> {
+                        $r::update(db, self, |val| val.$fk = $fk)
+                    }
+                )*
+
+                $(
+                    fn [<set_ $nullfk>](self, db: &mut DbStore4, $nullfk: Option<<$nullfk_ref as Entity>::Key>) -> Result<(), Error> {
+                        $r::update(db, self, |val| val.$nullfk = $nullfk)
+                    }
+                )*
+            }
+        }
+    };
+}
+
+impl_rel!(Track
+    primary key (id: TrackId)
+    foreign keys (album: Album, artist: Artist)
+    nullable foreign keys ()
+    cluster (album,id)
+    delete cascade ()
+    delete nullify ()
+    delete deny ()
+);
+
+impl_rel!(Album
+    primary key (id: AlbumId)
+    foreign keys ()
+    nullable foreign keys (album_artist: Artist)
+    delete cascade (Track . album)
+    delete nullify ()
+    delete deny ()
+);
+
+impl_rel!(Artist
+    primary key (id: ArtistId)
+    foreign keys ()
+    nullable foreign keys ()
+    delete cascade (Track . artist)
+    delete nullify (Album . album_artist)
+    delete deny ()
+);
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+/*#[derive(Clone)]
 struct Db {
     track_db: TrackDbStore,
 }
@@ -62,270 +491,51 @@ impl HasStore<TrackDbStore> for Db {
     fn store_mut(&mut self) -> &mut TrackDbStore {
         &mut self.track_db
     }
-}
-
-/*
-fn query_album_tracks<DB>(
-    album_query: impl Query<DB, Item = Album> + Clone + 'static,
-) -> impl Query<DB, Item = Track>
-where
-    DB: HasStore<TrackDbStore> + ?Sized,
-{
-    #[derive(Clone)]
-    struct Q<A>(A);
-
-    impl<A, DB> Query<DB> for Q<A>
-    where
-        DB: HasStore<TrackDbStore> + ?Sized,
-        A: Query<DB, Item = Album> + Clone + 'static,
-    {
-        type Item = Track;
-
-        fn iter<'a>(self, db: &'a DB) -> impl Iterator<Item = Track> + 'a {
-            self.0
-                .iter(db)
-                .flat_map(|album| album.tracks(db).iter().cloned())
-        }
-
-        fn delta<'a>(self, db: &'a DB, prev: &'a DB) -> impl Iterator<Item = Delta<Track>> + 'a {
-            self.0.iter(db).flat_map(move |album| {
-                // Might be good to store the delta in a vec instead of traversing the store multiple times
-                db.store()
-                    .Track
-                    .delta(&prev.store().Track)
-                    .filter_map(move |track| match track {
-                        Delta::Insert(track) => {
-                            if track.album(db) == album {
-                                Some(Delta::Insert(track))
-                            } else {
-                                None
-                            }
-                        }
-                        Delta::Remove(track) => {
-                            if track.album(prev) == album {
-                                Some(Delta::Remove(track))
-                            } else {
-                                None
-                            }
-                        }
-                        Delta::Update(track) => {
-                            let prev_album = track.album(prev);
-                            let new_album = track.album(db);
-
-                            match (prev_album, new_album) {
-                                (prev_album, new_album)
-                                    if prev_album == new_album && new_album == album =>
-                                {
-                                    Some(Delta::Update(track))
-                                }
-                                (prev_album, _) if prev_album == album => {
-                                    Some(Delta::Remove(track))
-                                }
-                                (_, new_album) if new_album == album => Some(Delta::Insert(track)),
-                                _ => None,
-                            }
-                        }
-                    })
-            })
-        }
-    }
-
-    Q(album_query)
-}*/
-
-struct Rel_Album_tracks;
-struct Rel_Track_album;
-struct Rel_Track_artist;
-struct Rel_Artist_tracks;
-
-impl Rel for Rel_Album_tracks {
-    type Src = Album;
-    type Dst = Track;
-    type Inverse = Rel_Track_album;
-    fn targets(src: &AlbumRow) -> impl Iterator<Item = Track> + '_ {
-        src.tracks.iter().cloned()
-    }
-}
-
-impl Rel for Rel_Track_album {
-    type Src = Track;
-    type Dst = Album;
-    type Inverse = Rel_Album_tracks;
-    fn targets(src: &TrackRow) -> impl Iterator<Item = Album> + '_ {
-        once(src.album)
-    }
-}
-
-impl Rel for Rel_Track_artist {
-    type Src = Track;
-    type Dst = Artist;
-    type Inverse = Rel_Artist_tracks;
-    fn targets(src: &TrackRow) -> impl Iterator<Item = Artist> + '_ {
-        once(src.artist)
-    }
-}
-
-impl Rel for Rel_Artist_tracks {
-    type Src = Artist;
-    type Dst = Track;
-    type Inverse = Rel_Track_artist;
-    fn targets(src: &ArtistRow) -> impl Iterator<Item = Track> + '_ {
-        src.tracks.iter().cloned()
-    }
-}
-
-/*
-// join on a many-to-one relationship, incremental on the right side
-macro_rules! decl_join {
-    ([$store:ident] $f:ident ($left:ident . $left_rel:ident => $right:ident . $right_rel:ident) ) => {
-        fn $f<DB, Q, T, FI>(query: Q, in_fn: FI) -> impl Query<DB, Item = (T, $right)>
-        where
-            DB: HasStore<$store> + ?Sized,
-            Q: Query<DB, Item = T> + Clone + 'static,
-            T: Clone + 'static,
-            FI: Fn(T) -> $left + Clone + 'static,
-        {
-            #[derive(Clone)]
-            struct Join<Q, FI> {
-                query: Q,
-                in_fn: FI,
-            }
-
-            impl<Q, T, DB, FI> Query<DB> for Join<Q, FI>
-            where
-                T: Clone + 'static,
-                DB: HasStore<$store> + ?Sized,
-                Q: Query<DB, Item = T> + Clone + 'static,
-                FI: Fn(T) -> $left + Clone + 'static,
-            {
-                type Item = (T, $right);
-
-                fn iter<'a>(self, db: &'a DB) -> impl Iterator<Item = (T, $right)> + 'a {
-                    self.query.iter(db).flat_map(move |left| {
-                        (self.in_fn)(left.clone())
-                            .$left_rel(db)
-                            .iter()
-                            .cloned()
-                            .map(move |right| (left.clone(), right))
-                    })
-                }
-
-                fn delta<'a>(
-                    self,
-                    db: &'a DB,
-                    prev: &'a DB,
-                ) -> impl Iterator<Item = Delta<(T, $right)>> + 'a {
-                    self.query.iter(db).flat_map(move |leftval| {
-                        let left = (self.in_fn)(leftval.clone());
-                        db.store()
-                            .$right
-                            .delta(&prev.store().$right)
-                            .filter_map(move |delta| match delta {
-                                Delta::Insert(right) if right.$right_rel(db) == left => {
-                                    Some(Delta::Insert(right))
-                                }
-                                Delta::Remove(right) if right.$right_rel(prev) == left => {
-                                    Some(Delta::Remove(right))
-                                }
-                                Delta::Update(right) => {
-                                    let old = right.$right_rel(prev);
-                                    let new = right.$right_rel(db);
-                                    match (old, new) {
-                                        (old, new) if old == new && new == left => {
-                                            Some(Delta::Update(right))
-                                        }
-                                        (old, _) if old == left => Some(Delta::Remove(right)),
-                                        (_, new) if new == left => Some(Delta::Insert(right)),
-                                        _ => None,
-                                    }
-                                }
-                                _ => None,
-                            })
-                            .map(move |delta| match delta {
-                                Delta::Insert(right) => Delta::Insert((leftval.clone(), right)),
-                                Delta::Remove(right) => Delta::Remove((leftval.clone(), right)),
-                                Delta::Update(right) => Delta::Update((leftval.clone(), right)),
-                            })
-                    })
-                }
-            }
-
-            Join { query, in_fn }
-        }
-    };
-}*/
-
-//decl_join!([TrackDbStore] join_album_tracks(Album.tracks => Track.album));
-//decl_join!([TrackDbStore] join_artist_tracks(Artist.tracks => Track.artist));
-
-/*
-struct Join<A, B>(A, B);
-impl<A, B, T, U, DB> Query<(T, U), DB> for Join<A, B> where DB: HasStore<TrackDbStore>, A: Query<T, DB>, B: Query<U, DB>
-{
-    fn iter(&self, db: &DB) -> impl Iterator<Item = (A::Item, B::Item)> {
-        self.0.iter(db).flat_map(move |a| {
-            self.1.iter(db).map(move |b| (a, b))
-        })
-    }
-
-    fn delta(&self, db: &DB, prev: &DB) -> impl Iterator<Item=Delta<(T, U)>> {
-        self.1.delta(db, prev).flat_map(move |b| {
-            self.0.iter(db).map(move |a| {
-                match b {
-                    Delta::Insert(b) => Delta::Insert((a, b)),
-                    Delta::Remove(b) => Delta::Remove((a, b)),
-                }
-            })
-        })
-    }
 }*/
 
 #[test]
 fn test_structs_and_enums_01() {
-    let mut db = Db {
-        track_db: TrackDbStore::new(),
-    };
+    type Db = DbStore4;
 
+    let mut db = Db::default();
     let db = &mut db;
 
-    let add_artist = |db: &mut Db, name: &str| {
-        let artist = Artist::all(db).find(|artist| artist.name(db) == name);
-
+    let mut add_artist = |db: &mut Db, name: &str| {
+        let artist = Artist::all(db)
+            .find(|artist| artist.name == name)
+            .map(|x| x.id);
         artist.unwrap_or_else(|| {
-            ArtistRow {
+            Artist::insert(db, |id| Artist {
+                id,
                 name: name.to_string(),
-                tracks: vec![],
-            }
-            .insert(db)
+            })
             .unwrap()
         })
     };
 
-    let add_album = |db: &mut Db, name: &str, album_artist: &str, year: u32| {
+    let mut add_album = |db: &mut Db, name: &str, album_artist: &str, year: u32| {
         let album_artist = add_artist(db, album_artist);
-        AlbumRow {
+        Album::insert(db, |id| Album {
+            id,
             name: name.to_string(),
-            album_artist,
             year,
-            tracks: vec![],
-        }
-        .insert(db)
+            album_artist: Some(album_artist),
+        })
         .unwrap()
     };
 
-    let add_track = |db: &mut Db, name: &str, artist_name: &str, album: Album| {
+    let mut add_track = |db: &mut Db, name: &str, artist_name: &str, album: AlbumId| {
         let artist = add_artist(db, artist_name);
-        TrackRow {
+        Track::insert(db, |id| Track {
+            id,
             name: name.to_string(),
-            artist,
             album,
-        }
-        .insert(db)
-        .unwrap()
+            artist,
+        }).unwrap()
     };
 
     let syrufit_over = add_album(db, "over", "Syrufit", 2011);
-    add_track(db, "Voice of Mist", "Maurits\"禅\"Cornelis", syrufit_over);
+    let voice_of_mist = add_track(db, "Voice of Mist", "Maurits\"禅\"Cornelis", syrufit_over);
     add_track(db, "Silent Story", "陽花", syrufit_over);
     add_track(
         db,
@@ -405,7 +615,102 @@ fn test_structs_and_enums_01() {
     let track_crazy_tonight = add_track(db, "Crazy☆Tonight", "NSY feat. IZNA", touhou_jihen);
     let track_imakokoni = add_track(db, "イマココニアルモノ", "NSY feat. IZNA", touhou_jihen);
 
-    let snapshot = db.clone();
+    // print all tracks
+
+    let print_all_tracks = |db: &Db| {
+        for track in Track::all(db) {
+            eprintln!(
+                "#{} [{}] {} ({}) ",
+                track.id.to_u32(),
+                track.album.fetch(db).unwrap().name,
+                track.name,
+                track.artist.fetch(db).unwrap().name,
+            );
+        }
+    };
+
+    eprintln!("====== Initial state ======");
+    print_all_tracks(db);
+
+    let old_timestamp = db.next();
+
+    // remove the first track of each album
+    let first_track = |db: &Db, album: AlbumId| {
+        Track::all(db)
+            .find(|track| track.album == album)
+            .unwrap()
+            .id
+    };
+    Track::delete(db, first_track(db, syrufit_over)).unwrap();
+    Track::delete(db, first_track(db, sally_sadomasochism)).unwrap();
+    Track::delete(db, first_track(db, touhou_jihen)).unwrap();
+
+    eprintln!("====== After removing the first track of each album ======");
+    print_all_tracks(db);
+
+    // test deletion cascade
+    syrufit_over.delete(db).unwrap();
+
+    eprintln!("====== After deleting the album 'over' ======");
+    print_all_tracks(db);
+
+    // move one track to another album
+    track_koumori.set_album(db, touhou_jihen).unwrap();
+    track_usaginimo.set_album(db, sally_sadomasochism).unwrap();
+
+    eprintln!("====== After moving tracks to other albums ======");
+    print_all_tracks(db);
+
+    // show track changes
+    eprintln!("====== Track changes ======");
+    for change in db.change_Track.iter() {
+        match &change.kind {
+            ChangeKind::Inserted(track) => eprintln!("Inserted: {}", track.name),
+            ChangeKind::Removed(track) => eprintln!("Removed: {}", track.name),
+        }
+    }
+
+
+    // album @ Album { id: album_id, name, .. },
+    // track @ Track { id: track_id, name: track_name, album: album_id }
+
+    // changes whenever an album is added/removed
+    // or when a track is added/removed
+
+    // only join on foreign keys
+    // when an album change, join on all tracks in the current DB, without the tracks added, removing the tracks removed
+    // same with tracks
+
+    // Album added -> implies all tracks modified (added or foreign key modified)
+    // Album removed -> implies all tracks modified (removed or foreign key modified)
+    //
+    // Issue: updating an unrelated property will
+
+    let mut delta = BTreeMap::new();
+
+    for c in db.change_Album.since(old_timestamp) {
+        match c {
+            ChangeKind::Inserted(album) => {
+                //eprintln!("Inserted album: {}", album.name);
+                for track in Track::all(db) {
+                    if track.album == album.id {
+                        delta.insert((album.id, track.id), (album, track));
+                    }
+                }
+            }
+            ChangeKind::Removed(album) => {
+                for track in Track::all(db) {
+                    if track.album == album.id {
+                        delta.remove(&(album.id, track.id));
+                    }
+                }
+            }
+        }
+    }
+
+
+
+    /*let snapshot = db.clone();
 
     // add extra tracks to all albums to test snapshots
     add_track(db, "Extra track 1", "Extra artist", syrufit_over);
@@ -413,16 +718,13 @@ fn test_structs_and_enums_01() {
     add_track(db, "Extra track 3", "Extra artist", touhou_jihen);
 
     // remove the first track of each album
-    let first_track =
-        |db: &dyn TrackDb, album: Album| album.tracks(db).iter().next().unwrap().clone();
-    first_track(db, syrufit_over)
-        .remove(db)
+    //let first_track =
+    //    |db: &dyn TrackDb, album: Album| album.tracks(db).iter().next().unwrap().clone();
+    db.remove::<Track>(voice_of_mist)
         .expect("track not found");
-    first_track(db, sally_sadomasochism)
-        .remove(db)
+    db.remove::<Track>(track_enn)
         .expect("track not found");
-    first_track(db, touhou_jihen)
-        .remove(db)
+    db.remove::<Track>(track_kokoronohame)
         .expect("track not found");
 
     // update some tracks
@@ -434,9 +736,9 @@ fn test_structs_and_enums_01() {
     // change the album of some tracks
     track_koumori.set_album(db, touhou_jihen).unwrap();
     track_usaginimo.set_album(db, sally_sadomasochism).unwrap();
-    track_crazy_tonight.set_album(db, syrufit_over).unwrap();
+    track_crazy_tonight.set_album(db, syrufit_over).unwrap();*/
 
-    eprintln!("\n------\nAlbum tracks: \n------");
+    /*eprintln!("\n------\nAlbum tracks: \n------");
     for ((album, album_row), (track, track_row)) in
         join(Album::query_all(), Rel_Album_tracks, |x| x).iter(db)
     {
@@ -517,7 +819,7 @@ fn test_structs_and_enums_01() {
             Delta::Remove(artist) => eprintln!("Remove: {}", artist.1.name),
             Delta::Update { old, new } => eprintln!("Update: {}", new.1.name),
         }
-    }
+    }*/
 
     /*// want tuples like:
     // (group_index, album, track_group_index, track)
