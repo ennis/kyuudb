@@ -22,7 +22,7 @@ impl RevIndex {
     }
 }
 
-pub trait Query<'a, DB: ?Sized> {
+/*pub trait Query<'a, DB: ?Sized> {
     type Item: 'a;
 
     /// Returns an iterator over all items produced by the query.
@@ -30,7 +30,12 @@ pub trait Query<'a, DB: ?Sized> {
 
     /// Returns an iterator over all changes to this query since a previous snapshot.
     fn delta(self, db: &'a DB, prev: &'a DB) -> impl Iterator<Item = Delta<Self::Item>> + 'a;
-}
+}*/
+
+// View ops:
+// - Projection (queries) (e.g. select name from album)
+// - Join (e.g. select album.name, track.name from album join track on album.id = track.album_id)
+
 
 // Query = impl Iterator<(K,V)>, V: 'a
 // join combinator: Iterator<(KS,V)>, Iterator<(KD,V)>

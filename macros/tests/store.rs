@@ -2,7 +2,7 @@
 
 use kyuudb::db::Trigger;
 use kyuudb::im::{HashMap, OrdMap, OrdSet};
-use kyuudb::{Delta, Error, HasStore, Query};
+use kyuudb::{Delta, Error, HasStore};
 use kyuudb_macros::store;
 use paste::paste;
 use std::cmp::Ordering;
@@ -17,7 +17,7 @@ use std::num::NonZeroU32;
 use std::ops::{Bound, RangeBounds};
 
 /*
-store! {
+store2! {
     /// Database schema for a music library.
     pub store TrackDb;
 
@@ -34,8 +34,8 @@ store! {
         #[key]
         id: TrackId,
         name: String,
-        ref album: AlbumId,
-        ref artist: ArtistId
+        rel album: AlbumId,
+        rel artist: ArtistId
     }
 
     /// Represents a playlist.
@@ -43,7 +43,7 @@ store! {
         #[key]
         id: PlaylistId,
         name: String,
-        ref tracks: TrackId* (unique)
+        //ref tracks: TrackId* (unique)
     }
 
     Artist {
@@ -52,14 +52,8 @@ store! {
         name: String
     }
 
-    /*PlaylistTracks {
-        #[key]
-        playlist: PlaylistId,
-        #[key]
-        track: TrackId
-    }*/
-}
-*/
+}*/
+
 
 pub trait Idx: Copy + Ord + Hash + fmt::Debug + Default {
     const MIN: Self;
@@ -173,36 +167,64 @@ impl Entity for Artist {
     }
 }
 
+/*
 #[derive(Clone)]
 enum ChangeKind<V> {
     Inserted(V),
     Removed(V),
-}
+}*/
 
-#[derive(Clone)]
-struct Change<V> {
+#[derive(Debug, Clone)]
+struct Change {
     timestamp: u64,
-    kind: ChangeKind<V>,
+    kind: ChangeKind,
 }
 
-struct ChangeSet<V> {
-    changes: Vec<Change<V>>,
+#[derive(Default)]
+struct ChangeSet {
+    changes: Vec<Change>,
 }
 
-impl<V> ChangeSet<V> {
-    fn since(&self, timestamp: u64) -> impl Iterator<Item = &ChangeKind<V>> {
+impl ChangeSet {
+    fn since(&self, timestamp: u64) -> impl Iterator<Item = &ChangeKind> {
         let last = self.changes.iter().rposition(|change| change.timestamp < timestamp).map(|i| i + 1).unwrap_or(0);
         self.changes[last..].iter().map(|change| &change.kind)
     }
 
-    fn push(&mut self, timestamp: u64, change: ChangeKind<V>) {
+    fn push(&mut self, timestamp: u64, change: ChangeKind) {
         self.changes.push(Change { timestamp, kind: change });
     }
+}
+
+#[derive(Debug, Clone)]
+enum ChangeKind {
+    Album_Inserted(AlbumId),
+    Album_Removed(AlbumId),
+    Album_name_Inserted(AlbumId, String),
+    Album_name_Removed(AlbumId, String),
+    Album_year_Inserted(AlbumId, u32),
+    Album_year_Removed(AlbumId, u32),
+    Album_album_artist_Inserted(AlbumId, ArtistId),
+    Album_album_artist_Removed(AlbumId, ArtistId),
+    Track_Inserted(TrackId),
+    Track_Removed(TrackId),
+    Track_name_Inserted(TrackId, String),
+    Track_name_Removed(TrackId, String),
+    Track_album_Inserted(TrackId, AlbumId),
+    Track_album_Removed(TrackId, AlbumId),
+    Track_artist_Inserted(TrackId, ArtistId),
+    Track_artist_Removed(TrackId, ArtistId),
+    Artist_Inserted(ArtistId),
+    Artist_Removed(ArtistId),
+    Artist_name_Inserted(ArtistId, String),
+    Artist_name_Removed(ArtistId, String),
 }
 
 #[derive(Default)]
 struct DbStore4 {
     timestamp: u64,
+
+    changes: ChangeSet,
 
     Album_next_id: AlbumId,
     Track_next_id: TrackId,
@@ -211,13 +233,8 @@ struct DbStore4 {
 
     clustered_Track: BTreeMap<(AlbumId, TrackId), Track>,
     pk_Track: BTreeMap<TrackId, (AlbumId, TrackId)>,
-    change_Track: ChangeSet<Track>,
-
     pk_Album: BTreeMap<AlbumId, Album>,
-    change_Album: ChangeSet<Album>,
-
     pk_Artist: BTreeMap<ArtistId, Artist>,
-    change_Artist: ChangeSet<Artist>,
 
     pk_Playlist: BTreeMap<PlaylistId, Playlist>,
     fk_Track_album: BTreeMap<(AlbumId, TrackId), ()>,
@@ -231,7 +248,7 @@ struct DbStore4 {
 impl DbStore4 {
     fn next(&mut self) -> u64 {
         self.timestamp += 1;
-        self.timestamp - 1
+        self.timestamp
     }
 }
 
@@ -259,6 +276,7 @@ macro_rules! impl_rel {
     (
         $r:ident
         primary key ($pk:ident: $pkty:ty)
+        attributes ($($attr:ident : $attr_ty:ty),*)
         foreign keys ($($fk:ident : $fk_ref:ident),*)
         nullable foreign keys ($($nullfk:ident : $nullfk_ref:ident),*)
         $(cluster ($($cluster_attr:ident),*))?
@@ -303,22 +321,22 @@ macro_rules! impl_rel {
                 }
 
 
-                fn fetch(db: &DbStore4, key: $pkty) -> Option<&$r> {
-                    let v = db.[<pk_ $r>].get(&key)?;
+                fn fetch(db: &DbStore4, key: $pkty) -> Result<&$r, Error> {
+                    let v = db.[<pk_ $r>].get(&key).ok_or(Error::EntityNotFound)?;
                     $(
                         __ignore!($($cluster_attr)*);
-                        let v = db.[<clustered_ $r>].get(&v)?;
+                        let v = db.[<clustered_ $r>].get(&v).ok_or(Error::EntityNotFound)?;
                     )?
-                    Some(v)
+                    Ok(v)
                 }
 
-                fn fetch_mut(db: &mut DbStore4, key: $pkty) -> Option<&mut $r> {
-                    let v = db.[<pk_ $r>].get_mut(&key)?;
+                fn fetch_mut(db: &mut DbStore4, key: $pkty) -> Result<&mut $r, Error> {
+                    let v = db.[<pk_ $r>].get_mut(&key).ok_or(Error::EntityNotFound)?;
                     $(
                         __ignore!($($cluster_attr)*);
-                        let v = db.[<clustered_ $r>].get_mut(&v)?;
+                        let v = db.[<clustered_ $r>].get_mut(&v).ok_or(Error::EntityNotFound)?;
                     )?
-                    Some(v)
+                    Ok(v)
                 }
 
                 fn all(db: &DbStore4) -> impl Iterator<Item = &$r> {
@@ -331,7 +349,7 @@ macro_rules! impl_rel {
                 }
 
                 fn delete(db: &mut DbStore4, key: $pkty) -> Result<$r, Error> {
-                    let v = Self::fetch(db, key).ok_or(Error::EntityNotFound)?;
+                    let v = Self::fetch(db, key)?;
                     Self::before_delete(db, v)?;
                     let deleted = Self::delete_inner(db, key)?;
                     Ok(deleted)
@@ -346,10 +364,11 @@ macro_rules! impl_rel {
                     )?
 
                     // record the change
-                    db.[<change_ $r>].push(Change {
-                        timestamp,
-                        kind: ChangeKind::Removed(deleted.clone()),
-                    });
+                    let timestamp = db.timestamp;
+                    $(db.changes.push(timestamp, ChangeKind::[< $r _ $attr _Removed >](deleted.$pk, deleted.$attr.clone()));)*
+                    $(db.changes.push(timestamp, ChangeKind::[< $r _ $fk _Removed >](deleted.$pk, deleted.$fk));)*
+                    $(if let Some(fk) = deleted.$nullfk { db.changes.push(timestamp, ChangeKind::[< $r _ $nullfk _Removed >](deleted.$pk, fk)); })*
+                    db.changes.push(timestamp, ChangeKind::[< $r _Removed >](deleted.$pk));
 
                      // update foreign key indices
                     $( db.[< fk_ $r _ $fk >].remove(&(deleted.$fk, deleted.id));)*
@@ -387,10 +406,10 @@ macro_rules! impl_rel {
 
                     // record the change
                     let timestamp = db.timestamp;
-                    db.[<change_ $r>].push(Change {
-                        timestamp,
-                        kind: ChangeKind::Inserted(val.clone()),
-                    });
+                    db.changes.push(timestamp, ChangeKind::[< $r _Inserted >](val.$pk));
+                    $(db.changes.push(timestamp, ChangeKind::[< $r _ $attr _Inserted >](val.$pk, val.$attr.clone()));)*
+                    $(db.changes.push(timestamp, ChangeKind::[< $r _ $fk _Inserted >](val.$pk, val.$fk));)*
+                    $(if let Some(fk) = val.$nullfk { db.changes.push(timestamp, ChangeKind::[< $r _ $nullfk _Inserted >](val.$pk, fk)); })*
 
                     // insert
                     let pk = val.$pk;
@@ -410,7 +429,7 @@ macro_rules! impl_rel {
 
                 // foreign key navigation
                 $(
-                    fn $fk(self, db: &DbStore4) -> Option<&$fk_ref> {
+                    fn $fk(self, db: &DbStore4) -> Result<&$fk_ref, Error> {
                         $fk_ref::fetch(db, self.$fk)
                     }
                 )*
@@ -429,20 +448,50 @@ macro_rules! impl_rel {
                     $r::delete(db, self)
                 }
 
-                fn fetch(self, db: &DbStore4) -> Option<&$r> {
+                fn fetch(self, db: &DbStore4) -> Result<&$r,Error> {
                     $r::fetch(db, self)
                 }
 
                 // foreign key setters
                 $(
                     fn [<set_ $fk>](self, db: &mut DbStore4, $fk: <$fk_ref as Entity>::Key) -> Result<(), Error> {
-                        $r::update(db, self, |val| val.$fk = $fk)
+                        let timestamp = db.timestamp;
+                        let val = $r::fetch_mut(db, self)?;
+                        let old_fk = std::mem::replace(&mut val.$fk, $fk);
+
+                        // TODO unique constraints
+                        db.[< fk_ $r _ $fk >].remove(&(old_fk, self));
+                        db.changes.push(timestamp, ChangeKind::[<$r _ $fk _Removed>](self, old_fk));
+                        db.[< fk_ $r _ $fk >].insert(($fk, self), ());
+                        db.changes.push(timestamp, ChangeKind::[<$r _ $fk _Inserted>](self, $fk));
+                        Ok(())
                     }
                 )*
 
                 $(
                     fn [<set_ $nullfk>](self, db: &mut DbStore4, $nullfk: Option<<$nullfk_ref as Entity>::Key>) -> Result<(), Error> {
-                        $r::update(db, self, |val| val.$nullfk = $nullfk)
+                        let val = $r::fetch_mut(db, self)?;
+                        let old_nullfk = std::mem::replace(&mut val.$nullfk, $nullfk);
+
+                        if let Some(fk) = old_nullfk {
+                            db.[< fk_ $r _ $nullfk >].remove(&(fk, self));
+                        }
+                        if let Some(fk) = $nullfk {
+                            db.[< fk_ $r _ $nullfk >].insert((fk, self), ());
+                        }
+                        Ok(())
+                    }
+                )*
+
+                // attribute setters
+                $(
+                    fn [<set_ $attr>](self, db: &mut DbStore4, $attr: $attr_ty) -> Result<(), Error> {
+                        let val = $r::fetch_mut(db, self)?;
+                        let old = std::mem::replace(&mut val.$attr, $attr.clone());
+                        let timestamp = db.timestamp;
+                        db.changes.push(timestamp, ChangeKind::[<$r _ $attr _Removed>](self, old));
+                        db.changes.push(timestamp, ChangeKind::[<$r _ $attr _Inserted>](self, $attr));
+                        Ok(())
                     }
                 )*
             }
@@ -452,6 +501,7 @@ macro_rules! impl_rel {
 
 impl_rel!(Track
     primary key (id: TrackId)
+    attributes (name: String)
     foreign keys (album: Album, artist: Artist)
     nullable foreign keys ()
     cluster (album,id)
@@ -462,6 +512,7 @@ impl_rel!(Track
 
 impl_rel!(Album
     primary key (id: AlbumId)
+    attributes (name: String, year: u32)
     foreign keys ()
     nullable foreign keys (album_artist: Artist)
     delete cascade (Track . album)
@@ -471,12 +522,227 @@ impl_rel!(Album
 
 impl_rel!(Artist
     primary key (id: ArtistId)
+    attributes (name: String)
     foreign keys ()
     nullable foreign keys ()
     delete cascade (Track . artist)
     delete nullify (Album . album_artist)
     delete deny ()
 );
+
+/*
+
+
+    for track_id in db.fk_Track_artist.keys(artist_id) {
+      if let album_id = db.pk_Track[track_id].album {
+        if let album_artist_id = db.pk_Album[album_id].album_artist {
+          // we have every key
+
+        }
+      }
+    }
+
+    for diff in db.changes.since(t).filter_map(|c| { match c { ChangeKind::[<$r _ $attr _Inserted>](id, val) => Some(id)), _ => None }) {
+
+    });
+
+    for $pk in db.[<fk_ $r _ $fk>].range($fk) {
+      let $r = $r::fetch(db, $pk).unwrap();
+      // do something with $r
+    }
+
+*/
+
+macro_rules! delta_loop {
+    (@insert $db:expr, () $b:block) => {
+        $b
+    };
+
+    (@remove $db:expr, () $b:block) => {
+        $b
+    };
+
+    (@insert $db:expr, ($lhs:ident >> $p:pat, $($rest:tt)*) $b:block) => {
+        paste!{
+            let Ok($p) = $lhs.fetch($db) else { continue };
+            delta_loop!(@insert $db, ($($rest)*) $b);
+        }
+    };
+
+    (@remove $db:expr, ($lhs:ident >> $p:pat, $($rest:tt)*) $b:block) => {
+        paste!{
+            let Ok($p) = $lhs.fetch($db) else { continue };
+            delta_loop!(@remove $db, ($($rest)*) $b);
+        }
+    };
+
+    (@insert $db:expr, ($lhs:ident << $r:ident . $fk:ident == $id:ident, $($rest:tt)*) $b:block) => {
+        paste!{
+            for $lhs in $db.[< fk_ $r _ $fk >].range(range_helper($id..=$id)).map(|((_, v),_)| *v) {
+                delta_loop!(@insert $db, ($($rest)*) $b);
+            }
+        }
+    };
+
+    (@remove $db:expr, ($lhs:ident << $r:ident . $fk:ident == $id:ident, $($rest:tt)*) $b:block) => {
+        paste!{
+            for $lhs in $db.[< fk_ $r _ $fk >].range(range_helper($id..=$id)).map(|((_, v),_)| *v) {
+                delta_loop!(@remove $db, ($($rest)*) $b);
+            }
+        }
+    };
+
+    (
+        $db:expr,
+        $t:expr,
+        $(($r:ident . $attr:ident $p:pat => $($rest:tt)*))*
+        $insert_block:block
+        $remove_block:block
+    ) => {
+        paste!{
+            for c in $db.changes.since($t)
+            {
+                match c {
+                    $(
+                        ChangeKind::[< $r _ $attr _Inserted >] $p => {
+                            delta_loop!(@insert $db, ($($rest)*) $insert_block);
+                        }
+                        ChangeKind::[< $r _ $attr _Removed >] $p => {
+                            delta_loop!(@remove $db, ($($rest)*) $remove_block);
+                        }
+                    )*
+                    _ => {}
+                }
+            }
+        }
+    };
+}
+
+/*
+    Track   { id: track_id, album: album_id, artist: artist_id, name: title, .. },
+    Album   { id: album_id, album_artist: album_artist_id, title: album_title, .. },
+    Artist  { id: album_artist_id, name: album_artist_name, .. },
+    Artist  { id: artist_id, name: track_artist_name, .. },
+
+    Problem with removal:
+    - if a Track is removed, we don't have Track.album anymore to join to
+
+    Solutions:
+    - somehow keep the previous version of the DB => hard, need to keep a copy of the entire DB or use OrdMap which we decided not to use
+    - have deletion records keep all attributes
+        - ChangeKind::Track_Removed(Track { id: track_id, album: album_id, artist: artist_id, name: title, .. })
+        - this way we have the Track.album
+        - problem #2: album might have been deleted as well, thus we don't know the album title or the album artist id
+            -> when looking up deleted values, also take into account deletion records?
+            -> "fetch_at" method that returns the value at a given timestamp, somehow
+    - Delete
+*/
+
+fn join_test(db: &DbStore4, t: u64) {
+
+    delta_loop!(db, t,
+        (Artist.name(artist_id, _) =>
+            track_id << Track.artist == artist_id,
+            track_id >> Track { name: title, album: album_id, .. },
+            album_id >> Album { name: album_title, album_artist: Some(album_artist_id), .. },
+            album_artist_id >> Artist { name: album_artist_name, .. },
+        )
+        (Album.album_artist(album_id, album_artist_id) =>
+            track_id << Track.album == album_id,
+            track_id >> Track { name: title, album: album_id, .. },
+            album_id >> Album { name: album_title, album_artist: Some(album_artist_id), .. },
+            album_artist_id >> Artist { name: album_artist_name, .. },
+        )
+        (Track.album(track_id, album_id) =>
+            track_id >> Track { name: title, album: album_id, .. },
+            album_id >> Album { name: album_title, album_artist: Some(album_artist_id), .. },
+            album_artist_id >> Artist { name: album_artist_name, .. },
+        )
+
+
+        {
+            println!("Inserted: {} from {} by {} ", title, album_title, album_artist_name);
+        }
+
+        /*(Track.name(track_id) =>
+            track_id >> Track { name: title, album: album_id, artist: artist_id, .. },
+            delete (track_id, album_id, .., ..)
+        )*/
+
+        {
+            println!("Removed: {} from {} by {} ", title, album_title, album_artist_name);
+        }
+    );
+}
+
+
+trait Query<DB> {
+    type Key;
+    type Output;    // usually Box<dyn Widget>
+
+    fn update(&mut self, db: &DB, change: &DB::Change) -> Delta<Self::Key, Self::Output>;
+}
+
+struct fn_root_0 {
+    //nodes: BTreeMap<>
+}
+
+impl Query<TrackDB> for album_0 {
+    fn update(&mut self, db: &TrackDB, change: &TrackDB::Change) -> Delta<Self::Key, Self::Output> {
+
+    }
+}
+
+struct NodeList<K,V> {
+    nodes: BTreeMap<K,V>
+}
+
+impl<K, V> NodeList<K,V> {
+    fn update(&mut self, db: &DB, change: &DB::Change) {
+        fn_root_0::update(db, change).apply(self.nodes);
+        fn_root_1::update(db, change).apply(self.nodes);
+        // ...
+    }
+}
+
+
+/*
+
+    fn track(id: TrackId) {
+        ui! {
+            select Track {id, name, album}, Album {id: album, title: album_title} {
+                // [#1]
+                // (dep={Track,Album})
+                // (address=(parent, id, album, #1))
+                // (add watch: Track.id, Album.id)
+                // ...
+            }
+        }
+    }
+
+    fn album(album_id: AlbumId) {
+        ui! {
+            select Track {id, album=album_id} {
+                // [#0]
+                // (dep={Track})
+                // (add watch: Track.id)
+                // (address=(parent, id, #0))
+                track(id)           // FIXME: this depends on Album as well, but nothing says so
+            }
+        }
+    }
+
+Resulting watches:
+
+    // for block #0
+    (Track.id(0)) -> ([#0], [.., 0, #0])
+    ...
+    (Track.id(N)) -> ([#0], [.., N, #0])
+
+    (Track.id) -> ([#1], [parent, id, album, #1])
+    (Album.id) -> ([#0], [parent, id, album, #0])
+
+ */
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 /*#[derive(Clone)]
@@ -632,6 +898,7 @@ fn test_structs_and_enums_01() {
     eprintln!("====== Initial state ======");
     print_all_tracks(db);
 
+    //////////////////////////////////////////////////////////////////
     let old_timestamp = db.next();
 
     // remove the first track of each album
@@ -648,11 +915,24 @@ fn test_structs_and_enums_01() {
     eprintln!("====== After removing the first track of each album ======");
     print_all_tracks(db);
 
+    //////////////////////////////////////////////////////////////////
+    eprintln!("====== Join test ======");
+    for change in db.changes.since(old_timestamp) {
+        eprintln!("- {:?}", change);
+    }
+    join_test(db, old_timestamp);
+
+    //////////////////////////////////////////////////////////////////
+    let old_timestamp = db.next();
+
     // test deletion cascade
     syrufit_over.delete(db).unwrap();
 
     eprintln!("====== After deleting the album 'over' ======");
     print_all_tracks(db);
+
+    //////////////////////////////////////////////////////////////////
+    let old_timestamp = db.next();
 
     // move one track to another album
     track_koumori.set_album(db, touhou_jihen).unwrap();
@@ -663,12 +943,13 @@ fn test_structs_and_enums_01() {
 
     // show track changes
     eprintln!("====== Track changes ======");
-    for change in db.change_Track.iter() {
-        match &change.kind {
-            ChangeKind::Inserted(track) => eprintln!("Inserted: {}", track.name),
-            ChangeKind::Removed(track) => eprintln!("Removed: {}", track.name),
-        }
+    for change in db.changes.changes.iter() {
+        eprintln!("- {:?}", change);
     }
+
+    //////////////////////////////////////////////////////////////////
+    eprintln!("====== Join test ======");
+    join_test(db, old_timestamp);
 
 
     // album @ Album { id: album_id, name, .. },
@@ -686,7 +967,7 @@ fn test_structs_and_enums_01() {
     //
     // Issue: updating an unrelated property will
 
-    let mut delta = BTreeMap::new();
+    /*let mut delta = BTreeMap::new();
 
     for c in db.change_Album.since(old_timestamp) {
         match c {
@@ -706,7 +987,7 @@ fn test_structs_and_enums_01() {
                 }
             }
         }
-    }
+    }*/
 
 
 

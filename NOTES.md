@@ -956,13 +956,620 @@ So, in terms of types, we have:
 ## UI trees from deltas
 
     for album in albums {
-        for track in album.tracks(db) {
-            // ...
-            // every item here is associated to two IDs: album and track
 
-            // album remove -> delete (album, ..)
-            // (track,album) removed -> delete (album, track)
+        // (dependency=album)
 
-            // album added
+        AlbumItem(album.title) (QA)   // album -> string (album_title)
+
+        Container {
+            for track in album.tracks(db) {
+                // dependency=album,track
+
+                with Artist { id=track.artist, name }         
+                    TrackItem(track.title, track.artist, album.artist) (QB)       
+              
+                // Album  { id=album_id, album_artist=album_artist_id, .. }, 
+                // Track  { album=album_id, artist=artist_id, title, .. }, 
+                // Artist { id=album_artist_id, name: album_artist_name, .. },
+                // Artist { id=artist_id, name: artist_name, .. }
+                
+                Text(album.title + track.title) (QC)
+                
+                // ...
+                // every item here is associated to two IDs: album and track
+    
+                // album remove -> delete (album, ..)
+                // (track,album) removed -> delete (album, track)
+    
+                // album added
+            }
         }
     }
+
+
+QB:
+
+Album.Artist { id=album_id, album_artist=album_artist_id },
+Album.Title  { id=album_id, album_title=album_title },
+Track.Album  { id=track_id, album=album_id },
+Track.Artist { id=track_id, artist=artist_id },
+Track.Title  { id=track_id, title=title }
+Artist.Name  { id=album_artist_id, name=album_artist_name },
+Artist.Name  { id=artist_id, name=track_artist_name },
+
+Variables:
+- album_id (pk)
+- track_id (pk)
+- album_artist_id (pk)
+- artist_id (pk)
+- album_artist_name
+- track_artist_name
+- title
+- album_title
+
+Key structure:
+(album_id, track_id, album_artist_id, artist_id)
+
+Dependencies:
+- Album.Artist
+- Album.Title
+- Track.Album
+- Track.Artist
+- Track.Title
+- Artist.Name
+
+Somehow, when, say, Artist.Name changes, must be able to reconstruct all pks (album_id, track_id, album_artist_id, artist_id)
+
+Artist.id
+-> Track.Artist { id=track_id, artist=artist_id },      // (via index)
+-> A
+    
+    for track_id in db.fk_Track_artist.keys(artist_id) {
+      if let album_id = db.pk_Track[track_id].album {
+        if let album_artist_id = db.pk_Album[album_id].album_artist {
+          // we have every key
+
+        }
+      }
+    }
+    
+
+
+QA == album @ Album(..) // watch for changes in albums
+
+QB == album @ Album(id,..), track @ Track(album=id,..) 
+// Item depends on album, track
+// album removed -> remove
+// track removed -> remove
+
+// watch for changes in tracks, return (album, track) where album = track.album
+// => don't care about changes in albums
+
+QC == album @ Album(id,..), track @ Track(album=id,..)
+// needs to be updated when album title changes
+
+example changelogs:
+removing an album:
+- remove album 0
+- remove track 1
+- remove track 2
+- remove track 3
+
+-> remove AlbumItem(0)
+    -> will also remove TrackItem(0,1..3)
+-> remove TrackItem(0, 1..3) => no-ops
+
+renaming an album:
+- remove album
+- remove track 1
+- remove track 2
+- remove track 3
+- add album
+- add track 1
+- add track 2
+- add track 3 
+(FIXME: track.album index is broken)
+
+-> remove AlbumItem(0)
+  -> will also remove TrackItem(0,1..3)
+-> remove TrackItem(0, 1..3) => no-ops
+-> add AlbumItem(0)
+-> add TrackItem(0,1..3)
+
+Problem: state of TrackItems are lost
+
+-------------------------
+
+renaming an album:
+- remove album_title(0)
+- insert album_title(0)
+
+tracks are unaffected
+=> modifications must be tracked per-attribute
+
+
+## Rule: we must track changes per-attribute
+
+Otherwise, if we only track changes at the entity level, we must assume that every attribute may have changed,
+including foreign keys, which introduces false dependencies.
+
+e.g. assume we have a UI of tracks, grouped by album. The group widget depends only on the name of the album.
+The tracks to display within a group are determined by a join (Album x Track) on Track.album; if the only title of the album changes,
+but we consider that the whole album might have changed (i.e. removed and added), then we must recalculate the join.
+(there are other examples, but not written down yet)
+
+-------------------------
+
+- delete rules
+- foreign key unique constraint
+- clustered indices
+- nullable foreign keys
+- foreign key update
+- redundant index when an FK is used in a clustered index
+
+
+Issue: 
+Insert/remove log items for individual attributes make no sense: we can't remove an attribute from an entity 
+
+
+We must "normalize" the change log somehow to make delta queries more tractable.
+
+Example of tricky situation:
+
+- Remove track(1).name 
+- Remove track(1).album 
+- Remove track(2).name 
+- Remove track(2).album
+- Remove track(3).name
+- Remove track(3).album
+- Remove album(id).name
+- Remove album(id).artist
+
+Query: track_name(id), track_album(id,album), album_name(album,name), album_artist(album,artist)
+
+- track(1).name removed
+-> compute the resulting delta on the join
+-> problem: track_album(1,album) is not there anymore
+
+- track(1).album removed
+-> we have id, album_id
+-> can't get album_name
+-> can't get artist because album was removed
+
+Solution: delete ranges
+Each item in a UI query has an associated key in the form `(a,b,c,d....)` composed of the PKs of each entity in the join.
+E.g. `(album,track,artist,album_artist)`. The query results are ordered by this key.
+
+if `track_album(1,album)` is not there, then album has been deleted, thus there will be a remove entry
+for `album`. In which case we can delete `(album,*,*,*)`
+if `track_album(1,album)` is still there, we can delete `(album,track,*,*)`.
+
+Basically, when an entity that appears in the composite key is deleted, try to reconstruct the keys that appear before in the composite:
+e.g. `track -> album`, `artist -> track -> album`, `artist -> album`
+If that's impossible, give up: this means that there's another "remove" entry for a "parent" entity
+
+
+
+1. Insert/Remove only whole tuples
+2. Split attributes in different tables by update frequency
+3. eliminate redundant removal and insertions
+
+
+## Diffs across many checkpoints?
+
+## Reality check: is it going to be more efficient than tree diffs?
+Not sure, and it will be hard to measure: would need two frameworks to compare.
+
+Plus there's a lot of things that remain unimplemented:
+- delta queries
+- UI macros
+
+
+## Reusable components
+
+    fn track(id: TrackId) {
+        ui! {
+            select Track {id, name, album}, Album {id: album, title: album_title} {
+                // QB
+                // (dep={Track,Album})
+                // (address=(parent, id, album, #0))
+                // (add watch: Track.id, Album.id)
+                // ...
+                
+            }
+        }
+    }
+
+    impl Query for TrackQ {
+        type Key = (i32, TrackId, AlbumId);
+    }
+
+
+    fn album(album_id: AlbumId) {
+        ui! {
+            // dep=???
+            select Track {id, album=album_id} {
+                // #QA
+                // (dep={Track})
+                // (add watch: Track.id)
+                // (address=(parent, id, #0))
+                // __album_0
+                track(id)           // FIXME: this depends on Album as well, but nothing says so
+            }
+        }
+    }
+
+    fn root() {
+        select Album{id} {
+            // #QR
+            // dep=Album, key = (#0, Album.id, #0)
+
+            // __root_0
+            album(id)
+        }
+    }
+
+(#QR, album=0) => `album(id)`
+(#QR, album=0, #QA, track=0) => `track(id)`
+(#QR, album=0, #QA, track=1) => `track(id)`
+...
+(#QR, album=0, #QA, track=9) => `track(id)`
+
+(#QR, album=0, #QA, track=9, #QB, album=1) => `track(id)`
+
+```rust
+#[derive(PartialEq, Hash)]
+enum RootKey {
+    __root_0(AlbumId, <album as Query>::Key)
+}
+
+
+#[derive(PartialEq, Hash)]
+enum album_Key {
+    __album_0(TrackId, AlbumId, <track as Query>::Key)
+}
+
+impl QueryKey for album_Key {
+    fn affected(&self, db: &TrackDB, change: ChangeKind) {
+        match change {
+            Track_Inserted(v) | Track_Removed(v) if v == self.0 => {
+                true
+            }
+            // ...
+            _ => {
+                self.2.affected(db, change);
+            }
+        }
+    }
+}
+
+// on every change, iterate over the whole list of nodes to see which are affected => not super efficient
+
+#[derive(PartialEq, Hash)]
+enum track_Key {
+    __track_0(TrackId, AlbumId)
+}
+
+impl QueryKey for track_Key {
+    //const DEPENDS: &[Attribute] = &[Track::A_ID, Album::A_ID, Track::A_NAME, Track::A_ALBUM, Album::A_TITLE];
+    
+    fn affected(&self, db: &TrackDB, change: ChangeKind) {
+        match change {
+            Track_Inserted(v) | Track_Removed(v) if v == self.0 => {
+                true
+            } 
+            Album_Inserted(v) | Album_Removed(v) if v == self.1 => {
+                true
+            }
+            Album_Name_Inserted(v,_) | Album_Name_Removed(v, _) if v == self.1 => {
+                true
+            }
+            _ => false
+        }
+    }
+}
+
+// Given a key, need to know if the element associated to the key is affected by the change (i.e. must be deleted and recreated)
+impl RootKey {
+    
+}
+
+fn test() {
+    let k = RootKey::__root_0(0, album_Key::__album_0(0, 0, track_Key::__track_0(0, 0)));
+    let k = RootKey::__root_0(0, album_Key::__album_0(1, 0, track_Key::__track_0(1, 0)));
+    let k = RootKey::__root_0(0, album_Key::__album_0(2, 0, track_Key::__track_0(2, 0)));
+    let k = RootKey::__root_0(0, album_Key::__album_0(3, 0, track_Key::__track_0(3, 0)));
+    let k = RootKey::__root_0(0, album_Key::__album_0(4, 0, track_Key::__track_0(4, 0)));
+    let k = RootKey::__root_0(0, album_Key::__album_0(5, 0, track_Key::__track_0(5, 0)));
+    
+    let nodes : HashMap<RootKey, Node> = Default::default();
+}
+
+
+
+
+```
+
+        VBox {
+            // select Album { id: album_id, name: album_name }
+            (album_id=0, #0, track_id=default) Header { "Album Name" }         // 
+            (album_id=0, #1, track_id=default) Separator
+
+            // select Track { id: track_id, album, name: track_name } where album == album_id
+            (album_id=0, #2, track_id=0) Group { Header("Track 1") }
+            (album_id=0, #2, track_id=0) Group { Header("Track 2") }
+            (album_id=0, #2, track_id=0) Group { Header("Track 3") }
+            (album_id=0, #2, track_id=0) Group { Header("Track 4") }
+            (album_id=0, #2, track_id=0) Group { Header("Track 5") }
+
+            // ... other albums ...
+        }
+
+
+
+```rust
+impl QAlbum {
+
+    fn update(&mut self, db: &DB, change: &DB::Change, parent: ()) {
+        match change {
+            ch!(inserted: Album(id)) => {
+                for query!(Album {id: album_id, name: album_name} where album_id == id) in db.query() {
+                    // run the query
+                }
+            }
+            ch!(removed: Album(id)) => {
+                list.remove_range((id, .., ..));
+            }            
+        }
+        
+        // update subqueries
+        // this loops over all albums
+        for query!(Album {id: album_id, name: album_name} ) in db.query() {
+            self.subquery.update(db, change, album_id);
+        }
+        
+    }
+    
+}
+
+impl QTrack {
+    
+    fn update(&mut self, db: &DB, change: &DB::Change, (album_id, album_name):() ) {
+        // where is album_id and album_name?
+        //
+    }
+}
+
+```
+
+
+Album/tracks:
+- syrufit: over
+  - Maurits"禅"Cornelis - Voice of Mist
+  - 陽花 - Silent Story
+   - 衝動的の人 - VAGRANT (MZC Falling Into Massive Galaxy Remix)
+   - Vivienne - With Me (MZC Paradigms To The Next Perspective Remix)
+   - Cocoon - History of the Moon (MZC Rise Of The Phenomenal Core Remix)
+   - Chen-U - Rendezvous
+
+When a track is added: 
+- re-run QA
+
+When the title of an album is changed:
+- re-run QB with album=(the id of the changed album)
+  - remove (track_id, album_id) where album_id = change.album_id
+  - insert
+
+When an album is removed:
+- remove nodes that depend on Album.id
+  - QR: 
+
+Track.id:
+  - QA: 
+
+Alternatives to full queries: run the procedure to build the tree, and it watches changes to the rows that it depends on. 
+
+
+Problem: in the macro, we know nothing about the components. 
+Basically, since we're **not a compiler**, we can't build and optimize queries across component boundaries.
+Solutions: 
+1. a separate compiler...
+2. build queries at runtime
+3. don't provide reusable components inside rust modules (a separate module system?)
+
+
+(2.) Building queries at runtime: meh, the philosophy was to generate straightforward rust code, but now we have to go through
+a runtime "interpreter" for queries, that are specified at runtime. They _could_ in theory be generated at compile-time,
+but we can't because we don't know enough about referenced queries during macro expansion.
+=> kind of a cop-out
+
+(3.) This means that we can't distribute UI/model components in crates. That's unacceptable (might as well design the whole language from scratch). 
+
+Meta note: it seems that we always end up with the same limitations of doing things with macros over an existing language:
+- graal/mlr for GPU pipelines: having a true compiler, we would be able to reason about how resources are used in the program, so that the user doesn't have to worry about usage flags, etc.
+- kyute: with a compiler we'd be able to better optimize `#[composable]` function calls with compile-time constant arguments.
+- and now this
+It's always suboptimal somehow (not enough information about the program is available).
+ 
+
+Big issue: it's easy to do stuff in a "self-contained" way, but it's **hard** to make that composable when it's embedded in another language (i.e. rust).
+E.g. you have query Q1 in a crate, Q2 in another, with optimized code generated for both queries in their respective crates. 
+How do you generate optimized code for a query Q3 that is a composition of the two? At this point, we lost the information
+that was used to generate the code Q1 and Q2, and that could be used to generate an optimized version of Q3.
+(the "information" here is the code passed to the macro used to define the queries)
+=> we must generate code for Q3 without knowing *anything* about the other queries (at macro expansion time)
+(there might be alternate approaches based on the type system, but they may rapidly devolve into inscrutable and unmaintainable type-level code)
+
+
+
+## Roadblock: hierarchies?
+
+Recursive queries seem hard, e.g.
+
+    fn node(id: NodeId) {
+        ui! {
+            Indent {
+                VBox {
+                    select Node{id: child_id, parent: id} {     // QA
+                        node(child_id)
+                    }
+                }
+            }
+        }
+    }
+
+First, it's not clear how to "invoke" or reuse queries.
+In this case, it's possible to run QA with parent=root, but if no nodes are added nothing will ever update
+
+From [A UI library for a relational language](https://www.scattered-thoughts.net/writing/relational-ui/#implementation)
+> Currently templates are limited to a fixed depth, so they can't express eg a file browser where the depth depends on the data. 
+> Allowing components to include themselves recursively would fix this, but it's non-obvious how to combine recursion with the query-based implementation I described earlier. 
+> It's probably not impossible, but I won't attempt to deal with it until I definitely need it.
+ 
+
+## UI tree
+
+    fn album_view(album: Album) -> impl Widget {
+        // If it takes an Album, then the function must be called again every time the album changes; 
+        // It must return either a diff for the tree, or the new widget.
+        // A complication is that parts of the returned view may change, regardless of whether the album changes 
+        // (e.g. a track may change, but the album row itself doesn't)
+        // which means that `album_view` must be invoked again if **anything inside** (i.e. any track) changes,
+        // since we can't call `track_view` independently of `album_view`
+    }
+
+    // Another approach: indirection
+    fn album_view(album: impl Query<Album>) -> impl Query<Widget> {
+        // effectively, this is called only once to set-up the incremental program
+        // Q: what about conditionals? 
+        // A: they would have to be encoded in the program
+
+        // Q: widget local state?
+        // A: 
+    }
+
+    
+
+    fn root() -> impl Widget {
+        VBox::new()
+            .children(
+                // query
+            )
+    }
+
+
+## Subscriptions?
+
+Subscribe to data changes. Child lists are "reactive lists".
+
+
+# Reality check
+
+All of this might be too complicated to implement in rust with macros (even proc-macros).
+Setting complexity aside, it's also complicated for users:
+- macro-heavy, so poor autocompletion
+- special syntax to learn in order to define the data model
+- no control over the data structures
+- mismatch between relational model and object graphs
+- control-flow, complexity is not obvious (abstracted away)
+   (should still be able to reason about perf though)
+- (?) hard to adapt/tweak to specific use cases (maybe?)
+
+Some concepts are worth keeping:
+- integrity rules
+- automatic change log for undo/redo
+
+However, incremental UI trees are complicated:
+- two-way incremental joins are doable
+- but composing multiple components with joins is not easy
+
+# Alternative
+
+Inspired by https://docs.rs/x-bow/0.2.0/x_bow/
+
+- Create your own structure for the application data: either relational or object graph, as required.
+- Automatically derive "lenses" to identify every part of the state (fields, array elements, map elements, ...)
+- Subscribe to changes on the state via lenses
+- Change state via lenses
+
+* Undo/redo can be implemented generically (since every change has to go through our lens methods).
+  * undo log entries are `(lens, value)` tuples
+* Emulate integrity rules by reacting to changes
+
+It's very much like veda's addresses.
+
+Q: how do we update the UI? Do callbacks hold pointers to parts of the UI tree?
+A: 
+
+
+Q: unsubscribing to changes?
+A: subscriptions are organized in trees; when a data item is removed, all associated subscriptions and those below are deleted.
+
+# About JS gui frameworks
+
+https://xi.zulipchat.com/#narrow/stream/147932-chatter/topic/the.20taxonomy.20of.20GUI.20paradigms/near/233018647
+
+> But there are flaws in relying too heavily on the JS world. One is that you basically have to assume DOM as an axiom. 
+> None of this helps answer these questions: Is DOM a good idea? If you were building an intermediate representation for GUI from scratch, how would you improve on DOM? 
+> What things currently handled by DOM should be moved into the higher level (CSS being too heavy-handed is a good candidate here)? Lower level?
+> And there's also, I think, an insidious effect of DOM on academic writing to sweep things under the rug that are handled by DOM. 
+> How do you express things like text entry state? Tab focus? Accessibility? In the DOM world, the answer to all these questions is basically, "the browser handles it." 
+> And so you see a pervasive underemphasis of persistent object identity in the academic literature on UI. I'm especially calling out the functional camp on this.
+ 
+
+# Rewriting the UI tree -- structure of the UI tree
+
+What kind of structure do we want for the UI tree?
+Options:
+
+### (OWNED) containers own their children / no generic traversal
+aka container-owns in druid
+(+) Minimal boilerplate, intuitive, less noisy
+(+) Very intuitive to build for the user (it's a regular composition of objects)
+(-) no traversal without cooperation (additional code) of the widget -> widgets are responsible for propagating events / visitors to their children
+(-) can't refer to a particular widget in the tree (which is important for several features): need widget IDs for that, and a separate hierarchy structure for widget IDs that must be in sync: error-prone
+Note: druid had bloom filters on widget IDs to "accelerate" delivery of messages to widgets with a specific ID, but they probably accelerate almost nothing in practice (abandoned for xilem)
+xilem has a separate hierarchy that must be kept in sync
+
+
+### (DOM) type-erased DOM-like structure
+
+(-) Might be more noisy
+(-) Widgets cannot constrain the type of their children, or wrap children in container-specific wrappers (e.g. `GridItem<T>`)
+(-) Might be **much less intuitive** for the user to build trees of widgets with this kind of structure (it's more complicated than just composing objects together)
+    -> it hurts especially for widget wrappers
+(+) Traversal does not need cooperation from the widget impl
+(+) Can refer and reach individual widgets deep inside the tree without a separate hierarchy
+
+
+Proposal: owned tree,  
+
+
+# Questioning the relational model
+
+Do we really need/want a flat relational model for the data? It makes sense for some applications (e.g. music database)
+but for simpler applications it can get in the way, compared to a traditional data model based on object trees.
+
+The model used in DBs come with interesting features like integrity checks, but it's not particularly complicated to enforce
+with object trees either; i.e. data consistency isn't the main motivator for a state management system.
+
+I'd argue that the main motivator and problem to solve is the question of reactivity, specifically related to UI updates.
+This entails: 
+- how to identify parts of the data,
+- track when/how parts of the data change 
+- how to specify that a part of the UI depends on some data 
+  - equivalently, how to _associate_ the identity of a UI element with some data in the data model
+- how to update the UI efficiently (that is, incrementally) when dependent data changes
+
+
+One advantage of the relational model is that it's flat, so it's easy to identify bits of data by using a tuple 
+(table, attribute, primary key).
+With object trees, you need to store the "path" to the bit of state in the tree, which can be arbitrarily long.
+
+Another thing with object trees is that UI elements will be associated (i.e. identified with) nodes of this tree. 
+However, this complicates UI elements that depend on two nodes in that are "far away":
+UI element end up depending on the "nearest common ancestor" of the two nodes, which can cause the element to 
+invalidate more frequently than needed.
+
+The relational data model may work better in this case: with joins we can precisely tell which tables+attributes 
+the element depends on (the dependency graph is more or less arbitrary).
